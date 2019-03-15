@@ -294,10 +294,12 @@ def setup_package():
             include_path=list(include_path),
             compiler_directives=COMPILER_DIRECTIVES,
         )
-        if len(ext_modules) == 0:
-            raise RuntimeError(
-                'There are no extension modules, Nothing to do!'
-            )
+        #if len(ext_modules) == 0:
+        #    raise RuntimeError(
+        #        'There are no extension modules, Nothing to do!'
+        #    )
+
+    print find_packages()
 
     setup(name='PyZoltan',
           version=info['__version__'],
@@ -310,7 +312,7 @@ def setup_package():
           keywords="Cython Zoltan Dynamic load balancing",
           packages=find_packages(),
           package_data={
-              '': ['*.pxd', '*.rst', '*.txt']
+              '': ['*.py', '*.pxd', '*.rst', '*.txt']
           },
           # exclude package data in installation.
           exclude_package_data={
