@@ -5,6 +5,7 @@ from numpy import random
 from pyzoltan.hetero.comm import Comm
 from compyle.array import wrap_array
 import pycuda.driver as drv
+import atexit
 
 drv.init()
 
@@ -16,7 +17,7 @@ size = comm.Get_size()
 dev = drv.Device(rank)
 ctx = dev.make_context()
 atexit.register(ctx.pop)
-atexit.register(MPI.Finalize)
+atexit.register(mpi.Finalize)
 
 # each processor creates some random data
 numObjectsTotal = 1 << 10
@@ -38,7 +39,7 @@ proclist[my_indices] = (rank + 1) % size
 
 # create the ZComm object
 tag = np.int32(0)
-hcomm = Comm(proclist, tag=tag, dtype=x.dtype)
+hcomm = Comm(proclist, tag=tag, dtype=x.dtype, backend='cuda')
 
 # the data to send and receive
 senddata = x[object_ids]
@@ -54,7 +55,6 @@ print("Proc %d, Received %s" % (rank, recvdata))
 # use zoltan to exchange unsigned ints
 senddata = gids[object_ids]
 recvdata = np.ones(hcomm.nreturn, dtype=np.uint32)
-hcomm.set_dtype(recvdata.dtype)
 
 print("Proc %d, Sending %s to %s" % (rank, senddata, proclist))
 senddata = wrap_array(senddata, backend='cuda')

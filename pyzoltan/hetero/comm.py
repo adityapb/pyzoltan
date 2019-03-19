@@ -39,8 +39,8 @@ class Comm(object):
         self.procs_to = np.array(procs_to, dtype=np.int32)
         self.lengths_to = np.array(lengths_to, dtype=np.int32)
         self.nblocks = self.procs_to.size
-        self.set_dtype(dtype)
         self._comm_invert_map(tag, self.lengths_to, self.procs_to)
+        self.blocked_senddata = None
 
     def _sort_proclist(self):
         order = np.argsort(self.proclist)
@@ -58,7 +58,7 @@ class Comm(object):
 
         self.comm.Reduce(msg_count, counts, root=self.root)
         self.comm.Scatter(counts, nrecvs, root=self.root)
-        self.nrecvs = nrecvs
+        self.nrecvs = int(nrecvs)
 
         ####################################################
         #max_nrecvs = np.array(0, dtype=np.int32)
@@ -68,12 +68,12 @@ class Comm(object):
         #self.comm.Bcast(max_nrecvs, root=self.root)
         ####################################################
 
-        self.lengths_from = np.zeros(nrecvs, dtype=np.int32)
+        self.lengths_from = np.zeros(self.nrecvs, dtype=np.int32)
         self.procs_from = np.zeros_like(self.lengths_from)
 
-        self.requests = [None for i in range(nrecvs)]
+        self.requests = [None for i in range(self.nrecvs)]
 
-        for i in range(nrecvs):
+        for i in range(self.nrecvs):
             self.requests[i] = self.comm.Irecv(
                     self.lengths_from[i:], source=mpi.ANY_SOURCE, tag=tag
                     )
@@ -81,7 +81,7 @@ class Comm(object):
         for i in range(self.nblocks):
             self.comm.Send(np.array(lengths_to[i]), dest=procs_to[i], tag=tag)
 
-        for i in range(nrecvs):
+        for i in range(self.nrecvs):
             self.requests[i].Wait(status=status)
             self.procs_from[i] = status.Get_source()
 
@@ -92,11 +92,6 @@ class Comm(object):
         np.cumsum(self.lengths_from[:-1], out=self.start_from[1:])
         self.nreturn = np.sum(self.lengths_from)
 
-    def set_dtype(self, dtype):
-        self.dtype = dtype
-        self.blocked_senddata = carr.zeros(self.nsends, dtype=dtype,
-                                           backend=self.backend)
-
     def comm_do_post(self, senddata, recvdata):
         # senddata and recvdata must be compyle Arrays
         #
@@ -106,14 +101,20 @@ class Comm(object):
         # Make continuous buffers for each process the data
         # has to be sent to
         # store sendbuff
+        if self.blocked_senddata is None or self.dtype != senddata.dtype:
+            self.blocked_senddata = carr.zeros(self.nsends, senddata.dtype,
+                                               backend=self.backend)
+            self.dtype = senddata.dtype
+
         senddata.align(self.order, out=self.blocked_senddata)
         for i in range(self.nrecvs):
             start = self.start_from[i]
             length = self.lengths_from[i]
             if length:
-                recvbuff = recvdata[start:start + length].get_buff()
+                recvbuff = recvdata.get_buff(offset=start)
                 self.requests[i] = self.comm.Irecv(
-                        recvbuff, source=self.procs_from[i], tag=self.tag
+                        [recvbuff, dtype_to_mpi(recvdata.dtype)],
+                        source=self.procs_from[i], tag=self.tag
                         )
 
         self.comm.Barrier()
@@ -122,8 +123,9 @@ class Comm(object):
             start = self.starts[i]
             length = self.lengths_to[i]
             if length:
-                sendbuff = self.blocked_senddata[start:start + length].get_buff()
-                self.comm.Rsend(sendbuff, self.procs_to[i], tag=self.tag)
+                sendbuff = self.blocked_senddata.get_buff(offset=start)
+                self.comm.Rsend([sendbuff, dtype_to_mpi(senddata.dtype)], dest=self.procs_to[i],
+                                tag=self.tag)
 
     def comm_do_wait(self):
         if self.nrecvs > 0:
