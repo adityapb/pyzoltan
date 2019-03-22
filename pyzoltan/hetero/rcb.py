@@ -77,13 +77,17 @@ class RCB(object):
                     nrecv_procs, source=mpi.ANY_SOURCE, tag=tag
                     )
 
-            req_procs.Wait()
+            req_procs.Wait(status=status)
+            self.parent = status.Get_source()
+
             self.nrecv_procs = int(nrecv_procs)
             self.procs = carr.empty(self.nrecv_procs, dtype=np.int32,
                                     backend=self.backend)
 
-            req_data.Wait(status=status)
-            self.parent = status.Get_source()
+            req_procs = self.comm.Irecv(self.procs, source=self.parent,
+                                        tag=tag)
+
+            req_data.Wait()
 
             self.nrecv_data = int(nrecv_data)
 
@@ -94,8 +98,8 @@ class RCB(object):
                                 source=self.parent, tag=tag))
                 self.data.append(x)
 
-            req_procs = self.comm.Irecv(self.procs, source=self.parent,
-                                        tag=tag)
+            # Barrier to ensure all recvs are posted before sends
+            self.comm.Barrier()
 
             req_procs.Wait()
 
@@ -112,8 +116,6 @@ class RCB(object):
 
         left_proc = int(self.procs[0])
         right_proc = int(self.procs[part_idx])
-
-        self.comm.Barrier()
 
         # transfer procs
         # left
