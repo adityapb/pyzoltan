@@ -15,8 +15,7 @@ def dtype_to_mpi(t):
 
 
 class Comm(object):
-    def __init__(self, proclist, tag=0, root=0, dtype=np.int32,
-                 backend=None):
+    def __init__(self, proclist, tag=0, root=0, backend=None):
         self.comm = mpi.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
@@ -124,8 +123,8 @@ class Comm(object):
             length = self.lengths_to[i]
             if length:
                 sendbuff = self.blocked_senddata.get_buff(offset=start)
-                self.comm.Rsend([sendbuff, dtype_to_mpi(senddata.dtype)], dest=self.procs_to[i],
-                                tag=self.tag)
+                self.comm.Rsend([sendbuff, dtype_to_mpi(senddata.dtype)],
+                                dest=self.procs_to[i], tag=self.tag)
 
     def comm_do_wait(self):
         if self.nrecvs > 0:
