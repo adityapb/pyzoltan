@@ -27,13 +27,13 @@ class RCB(object):
     of objects as well as processes. This is continued recursively
     until each set has a single process.
     '''
-    def __init__(self, data, backend=None):
+    def __init__(self, ndims, data=[], backend=None):
         self.comm = mpi.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
         self.backend = get_backend(backend)
         self.data = data
-        self.ndims = len(data)
+        self.ndims = ndims
 
     def _partition_procs(self):
         # NOTE: This can be made better using the weights
@@ -43,23 +43,12 @@ class RCB(object):
         return part_idx, target_w
 
     def _partition_domain(self, target_w):
-        self.x.update_min_max()
-        self.y.update_min_max()
-        self.z.update_min_max()
+        for x in self.data:
+            x.update_min_max()
 
-        xlength = self.x.maximum - self.x.minimum
-        ylength = self.y.maximum - self.y.minimum
-        zlength = self.z.maximum - self.z.minimum
+        lengths = [x.maximum - x.minimum for x in self.data]
 
-        if xlength > ylength and xlength > zlength:
-            # sort according to x
-            pass
-        if ylength > xlength and ylength > zlength:
-            # sort according to y
-            pass
-        if zlength > xlength and zlength > ylength:
-            # sort according to z
-            pass
+        # sort according to max length dim
 
         target_idx = carr.zeros(1, dtype=np.int32, backend=self.backend)
 
@@ -98,22 +87,15 @@ class RCB(object):
 
             self.nrecv_data = int(nrecv_data)
 
-            self.x = carr.empty(self.nrecv_data, dtype=self.dtype,
-                                backend=self.backend)
-            self.y = carr.empty(self.nrecv_data, dtype=self.dtype,
-                                backend=self.backend)
-            self.z = carr.empty(self.nrecv_data, dtype=self.dtype,
-                                backend=self.backend)
+            for i in range(self.ndims):
+                x = carr.empty(self.nrecv_data, dtype=self.dtype,
+                               backend=self.backend)
+                requests.append(self.comm.Irecv(x.get_buff(),
+                                source=self.parent, tag=tag))
+                self.data.append(x)
 
             req_procs = self.comm.Irecv(self.procs, source=self.parent,
                                         tag=tag)
-
-            requests.append(self.comm.Irecv(self.x.get_buff(),
-                            source=self.parent, tag=tag))
-            requests.append(self.comm.Irecv(self.y.get_buff(),
-                            source=self.parent, tag=tag))
-            requests.append(self.comm.Irecv(self.z.get_buff(),
-                            source=self.parent, tag=tag))
 
             req_procs.Wait()
 
@@ -142,19 +124,12 @@ class RCB(object):
                             dest=left_proc, tag=tag)
 
         # transfer x, y, z
-        # left
-        self.comm.mpi_Rsend(self.x.get_buff(offset=0),
-                            dest=left_proc, tag=tag)
-        self.comm.mpi_Rsend(self.y.get_buff(offset=0),
-                            dest=left_proc, tag=tag)
-        self.comm.mpi_Rsend(self.z.get_buff(offset=0),
-                            dest=left_proc, tag=tag)
-        # right
-        self.comm.mpi_Rsend(self.x.get_buff(offset=target_idx),
-                            dest=right_proc, tag=tag)
-        self.comm.mpi_Rsend(self.y.get_buff(offset=target_idx),
-                            dest=right_proc, tag=tag)
-        self.comm.mpi_Rsend(self.z.get_buff(offset=target_idx),
-                            dest=right_proc, tag=tag)
+        for x in self.data:
+            # left
+            self.comm.mpi_Rsend(x.get_buff(offset=0),
+                                dest=left_proc, tag=tag)
+            # right
+            self.comm.mpi_Rsend(x.get_buff(offset=target_idx),
+                                dest=right_proc, tag=tag)
 
 
