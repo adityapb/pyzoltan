@@ -15,29 +15,37 @@ def dtype_to_mpi(t):
 
 
 class Comm(object):
-    def __init__(self, proclist, tag=0, root=0, backend=None):
+    def __init__(self, proclist, tag=0, root=0, backend=None, sorted=False):
         self.comm = mpi.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
+        self.sorted = sorted
         self.backend = get_backend(backend)
         self.root = root
         self.nsends = len(proclist)
         self.proclist = proclist
         self.tag = tag
-        self.order = carr.wrap_array(self._sort_proclist(),
-                                     backend=self.backend)
-        starts, procs_to, lengths_to = [0], [proclist[0]], [1]
-        for i in range(1, self.nsends):
-            if proclist[i] != proclist[i-1]:
-                starts.append(i)
-                procs_to.append(proclist[i])
-                lengths_to.append(1)
-            else:
-                lengths_to[-1] += 1
-        self.starts = np.array(starts, dtype=np.int32)
-        self.procs_to = np.array(procs_to, dtype=np.int32)
-        self.lengths_to = np.array(lengths_to, dtype=np.int32)
-        self.nblocks = self.procs_to.size
+        if self.proclist != None and self.proclist.size > 0:
+            if not self.sorted:
+                self.order = carr.wrap_array(self._sort_proclist(),
+                                             backend=self.backend)
+            starts, procs_to, lengths_to = [0], [proclist[0]], [1]
+            for i in range(1, self.nsends):
+                if proclist[i] != proclist[i-1]:
+                    starts.append(i)
+                    procs_to.append(proclist[i])
+                    lengths_to.append(1)
+                else:
+                    lengths_to[-1] += 1
+            self.starts = np.array(starts, dtype=np.int32)
+            self.procs_to = np.array(procs_to, dtype=np.int32)
+            self.lengths_to = np.array(lengths_to, dtype=np.int32)
+            self.nblocks = self.procs_to.size
+        else:
+            self.starts = np.empty(0, dtype=np.int32)
+            self.procs_to = np.empty(0, dtype=np.int32)
+            self.lengths_to = np.empty(0, dtype=np.int32)
+            self.nblocks = 0
         self._comm_invert_map(tag, self.lengths_to, self.procs_to)
         self.blocked_senddata = None
 
@@ -100,12 +108,16 @@ class Comm(object):
         # Make continuous buffers for each process the data
         # has to be sent to
         # store sendbuff
-        if self.blocked_senddata is None or self.dtype != senddata.dtype:
-            self.blocked_senddata = carr.zeros(self.nsends, senddata.dtype,
-                                               backend=self.backend)
-            self.dtype = senddata.dtype
+        if not self.sorted:
+            if self.blocked_senddata is None or self.dtype != senddata.dtype:
+                self.blocked_senddata = carr.zeros(self.nsends, senddata.dtype,
+                                                   backend=self.backend)
+                self.dtype = senddata.dtype
 
-        senddata.align(self.order, out=self.blocked_senddata)
+            senddata.align(self.order, out=self.blocked_senddata)
+        else:
+            self.blocked_senddata = senddata
+
         for i in range(self.nrecvs):
             start = self.start_from[i]
             length = self.lengths_from[i]

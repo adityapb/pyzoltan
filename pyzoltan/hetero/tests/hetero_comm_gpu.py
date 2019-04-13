@@ -39,7 +39,7 @@ proclist[my_indices] = (rank + 1) % size
 
 # create the ZComm object
 tag = np.int32(0)
-hcomm = Comm(proclist, tag=tag, dtype=x.dtype, backend='cuda')
+hcomm = Comm(proclist, tag=tag, backend='cuda')
 
 # the data to send and receive
 senddata = x[object_ids]
