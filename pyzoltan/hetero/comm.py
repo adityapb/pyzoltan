@@ -2,6 +2,7 @@ import mpi4py.MPI as mpi
 import numpy as np
 import compyle.array as carr
 from compyle.array import get_backend
+from compyle.types import NP_TYPE_LIST
 
 
 def dtype_to_mpi(t):
@@ -25,7 +26,7 @@ class Comm(object):
         self.nsends = len(proclist)
         self.proclist = proclist
         self.tag = tag
-        if self.proclist != None and self.proclist.size > 0:
+        if len(self.proclist) > 0:
             if not self.sorted:
                 self.order = carr.wrap_array(self._sort_proclist(),
                                              backend=self.backend)
@@ -67,14 +68,6 @@ class Comm(object):
         self.comm.Scatter(counts, nrecvs, root=self.root)
         self.nrecvs = int(nrecvs)
 
-        ####################################################
-        #max_nrecvs = np.array(0, dtype=np.int32)
-        #if self.rank == self.root:
-        #    max_nrecvs = np.max(counts)
-
-        #self.comm.Bcast(max_nrecvs, root=self.root)
-        ####################################################
-
         self.lengths_from = np.zeros(self.nrecvs, dtype=np.int32)
         self.procs_from = np.zeros_like(self.lengths_from)
 
@@ -82,7 +75,7 @@ class Comm(object):
 
         for i in range(self.nrecvs):
             self.requests[i] = self.comm.Irecv(
-                    self.lengths_from[i:], source=mpi.ANY_SOURCE, tag=tag
+                    self.lengths_from[i:i+1], source=mpi.ANY_SOURCE, tag=tag
                     )
 
         for i in range(self.nblocks):
@@ -99,6 +92,30 @@ class Comm(object):
         np.cumsum(self.lengths_from[:-1], out=self.start_from[1:])
         self.nreturn = np.sum(self.lengths_from)
 
+    def get_recvdtype(self, senddtype):
+        recvdtype = np.zeros_like(self.procs_from)
+        senddtype = NP_TYPE_LIST.index(senddtype)
+
+        if senddtype == -1:
+            raise ValueError("Invalid type for send array")
+
+        for i in range(self.nrecvs):
+            self.requests[i] = self.comm.Irecv(
+                    recvdtype[i:i+1], source=self.procs_from[i],
+                    tag=self.tag
+                    )
+
+        for i in range(self.nblocks):
+            self.comm.Send(np.array(senddtype, dtype=np.int32),
+                           dest=self.procs_to[i], tag=self.tag)
+
+        mpi.Request.Waitall(self.requests)
+
+        if not np.all(recvdtype == recvdtype[0]):
+            raise ValueError("All sends should have same datatype")
+
+        return NP_TYPE_LIST[recvdtype[0]]
+
     def comm_do_post(self, senddata, recvdata):
         # senddata and recvdata must be compyle Arrays
         #
@@ -109,7 +126,8 @@ class Comm(object):
         # has to be sent to
         # store sendbuff
         if not self.sorted:
-            if self.blocked_senddata is None or self.dtype != senddata.dtype:
+            if senddata and (self.blocked_senddata is None or \
+                    self.dtype != senddata.dtype):
                 self.blocked_senddata = carr.zeros(self.nsends, senddata.dtype,
                                                    backend=self.backend)
                 self.dtype = senddata.dtype
@@ -118,15 +136,18 @@ class Comm(object):
         else:
             self.blocked_senddata = senddata
 
+        self.requests = []
+
         for i in range(self.nrecvs):
             start = self.start_from[i]
             length = self.lengths_from[i]
             if length:
-                recvbuff = recvdata.get_buff(offset=start)
-                self.requests[i] = self.comm.Irecv(
+                recvbuff = recvdata.get_buff(offset=start,
+                                             length=length)
+                self.requests.append(self.comm.Irecv(
                         [recvbuff, dtype_to_mpi(recvdata.dtype)],
                         source=self.procs_from[i], tag=self.tag
-                        )
+                        ))
 
         self.comm.Barrier()
 
@@ -134,12 +155,13 @@ class Comm(object):
             start = self.starts[i]
             length = self.lengths_to[i]
             if length:
-                sendbuff = self.blocked_senddata.get_buff(offset=start)
+                sendbuff = self.blocked_senddata.get_buff(offset=start,
+                                                          length=length)
                 self.comm.Rsend([sendbuff, dtype_to_mpi(senddata.dtype)],
                                 dest=self.procs_to[i], tag=self.tag)
 
     def comm_do_wait(self):
-        if self.nrecvs > 0:
+        if self.requests:
             mpi.Request.Waitall(self.requests)
 
     def comm_do(self, senddata, recvdata):
