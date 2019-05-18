@@ -14,7 +14,7 @@ rank = comm.Get_rank()
 size = comm.Get_size()
 
 if rank == 0:
-    numObjectsTotal = 2000
+    numObjectsTotal = 1000
 
     print("Total num objects = %s" % numObjectsTotal)
 
@@ -48,8 +48,6 @@ lb.set_proc_weights(proc_weights)
 lb.load_balance()
 
 print("After lb, rank %s = %s" % (rank, lb_data.num_objs))
-
-print(rank, lb.lb_obj.min, lb.lb_obj.max)
 
 if rank == 0:
     import matplotlib.pyplot as plt

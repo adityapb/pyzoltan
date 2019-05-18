@@ -1,16 +1,25 @@
 import mpi4py.MPI as mpi
 import numpy as np
 import compyle.array as carr
-from compyle.array import get_backend
+from compyle.array import get_backend, wrap, update_minmax
 from compyle.api import annotate
 from compyle.parallel import Scan
-from pyzoltan.hetero.comm import Comm, dtype_to_mpi
+from compyle.template import Template
+from pyzoltan.hetero.comm import Comm, CommBase, dtype_to_mpi
+from pytools import memoize
 
 
 def dbg_print(msg):
     comm = mpi.COMM_WORLD
     rank = comm.Get_rank()
     print("Rank %s: %s" % (rank, msg))
+
+
+def root_print(msg):
+    comm = mpi.COMM_WORLD
+    rank = comm.Get_rank()
+    if rank == 0:
+        print(msg)
 
 
 @annotate
@@ -22,6 +31,37 @@ def inp_partition_domain(i, weights):
 def out_partition_domain(i, item, prev_item, target_w, target_idx):
     if item >= target_w and prev_item < target_w:
         target_idx[0] = i
+
+
+class PointAssign(Template):
+    def __init__(self, name, ndims):
+        super(PointAssign, self).__init__(name=name)
+        self.ndims = ndims
+        self.args = []
+        for i in range(self.ndims):
+            self.args.append('x%s' % i)
+
+    def extra_args(self):
+        return self.args, {}
+
+    def template(self, i, keys, bin_size):
+        '''
+        for j in range(size):
+            count = 0
+            proc = procs[j]
+
+            % for dim in range(obj.ndims)
+            pmax_dim = maxs[proc * ndims + dim]
+            pmin_dim = mins[proc * ndims + dim]
+
+            if x${dim}[i] <= pmax_dim and x${dim}[i] >= pmin_dim:
+                count += 1
+            % endfor
+
+            if count == ${obj.ndims}:
+                new_proc[i] = proc
+                return
+        '''
 
 
 class RCB(object):
@@ -69,12 +109,13 @@ class RCB(object):
             self.gids = carr.arange(0, nobjs, 1, dtype=np.int32,
                                     backend=self.backend)
 
-
         if self.rank == self.root and self.weights is None:
             ndata = self.gids.length
             self.weights = carr.empty(ndata, np.float32,
                                       backend=self.backend)
             self.weights.fill(1. / ndata)
+        elif self.rank == self.root:
+            self.weights.dev /= carr.sum(self.weights)
 
         if self.rank == self.root and self.proc_weights is None:
             self.proc_weights = carr.empty(self.size, np.float32,
@@ -93,8 +134,10 @@ class RCB(object):
         self.max = np.zeros(self.ndims, dtype=self.dtype)
         self.min = np.zeros(self.ndims, dtype=self.dtype)
 
+        if self.coords_view:
+            update_minmax(self.coords_view)
+
         for i, x in enumerate(self.coords_view):
-            x.update_min_max()
             self.max[i] = x.maximum
             self.min[i] = x.minimum
 
@@ -114,7 +157,12 @@ class RCB(object):
 
         order = carr.argsort(self.coords_view[maxlen_idx])
 
-        inp_list = [self.gids_view] + self.coords_view
+        align_coords = []
+        for i, x in enumerate(self.coords_view):
+            if i != maxlen_idx:
+                align_coords.append(x)
+
+        inp_list = [self.gids_view, self.weights_view] + align_coords
 
         # FIXME: Is allocating more expensive than memcopy?
         if not self.out_list:
@@ -129,8 +177,14 @@ class RCB(object):
         carr.align(inp_list, order, out_list=self.out_list,
                    backend=self.backend)
         self.gids_view = self.out_list[0].copy()
-        for i, out in enumerate(self.out_list[1:]):
-            self.coords_view[i] = out.copy()
+        self.weights_view = self.out_list[1].copy()
+
+        curr_head = 2
+        for i in range(self.ndims):
+            if i != maxlen_idx:
+                out = self.out_list[curr_head]
+                self.coords_view[i] = out.copy()
+                curr_head += 1
 
         target_idx = carr.zeros(1, dtype=np.int32, backend=self.backend)
 
@@ -145,7 +199,7 @@ class RCB(object):
 
         return maxlen_idx, target_idx
 
-    def gather(self):
+    def gather(self, data):
         nobjs_to_get = None
         if self.rank == self.root:
             nobjs_to_get = np.zeros(self.size,
@@ -158,53 +212,95 @@ class RCB(object):
 
         if self.rank == self.root:
             total_nobjs = np.sum(nobjs_to_get)
-            gath_gids = carr.empty(total_nobjs, np.int32)
-            gath_weights = carr.empty(total_nobjs, np.float32)
-            gath_coords = [carr.empty(total_nobjs, self.dtype) \
+            gath_gids = carr.empty(total_nobjs, np.int32,
+                                   backend=self.backend)
+            gath_weights = carr.empty(total_nobjs, np.float32,
+                                      backend=self.backend)
+            gath_coords = [carr.empty(total_nobjs, self.dtype, backend=self.backend) \
                     for i in range(self.ndims)]
-            gath_proc_weights = carr.empty(self.size, np.float32)
+            gath_proc_weights = carr.empty(self.size, np.float32,
+                                           backend=self.backend)
+            gath_procs = carr.arange(0, self.size, 1, dtype=np.int32,
+                                     backend=self.backend)
+            gath_data = [carr.empty(total_nobjs, x.dtype, backend=self.backend) \
+                    for x in data]
+
+            gath_gids_buff = gath_gids.get_buff()
+            gath_weights_buff = gath_weights.get_buff()
+            gath_coords_buff = [x.get_buff() for x in gath_coords]
+            gath_proc_weights_buff = gath_proc_weights.get_buff()
+            gath_data_buff = [x.get_buff() for x in gath_data]
+
+            displs = np.zeros(self.size, dtype=np.int32)
+            np.cumsum(nobjs_to_get[:-1], out=displs[1:])
         else:
             gath_gids, gath_weights, gath_proc_weights = None, None, None
             gath_coords = [None] * self.ndims
+            gath_procs = None
+            gath_data = [None] * len(data)
+
+            gath_gids_buff = None
+            gath_weights_buff = None
+            gath_coords_buff = [None] * self.ndims
+            gath_proc_weights_buff = None
+            gath_data_buff = [None] * len(data)
+
+            displs = None
 
         self.comm.Gatherv(sendbuf=[self.gids_view.get_buff(),
                                    dtype_to_mpi(self.gids_view.dtype)],
-                          recvbuf=[gath_gids.get_buff(), nobjs_to_get],
+                          recvbuf=[gath_gids_buff, nobjs_to_get, displs,
+                                   dtype_to_mpi(self.gids_view.dtype)],
                           root=self.root)
 
         self.comm.Gatherv(sendbuf=[self.weights_view.get_buff(),
                                    dtype_to_mpi(self.weights_view.dtype)],
-                          recvbuf=[gath_weights.get_buff(), nobjs_to_get],
+                          recvbuf=[gath_weights_buff, nobjs_to_get, displs,
+                                   dtype_to_mpi(self.weights_view.dtype)],
                           root=self.root)
 
         for i, x in enumerate(self.coords_view):
             self.comm.Gatherv(sendbuf=[x.get_buff(),
                                        dtype_to_mpi(x.dtype)],
-                              recvbuf=[gath_coords[i].get_buff(), nobjs_to_get],
+                              recvbuf=[gath_coords_buff[i], nobjs_to_get, displs,
+                                       dtype_to_mpi(x.dtype)],
                               root=self.root)
 
         self.comm.Gather([self.proc_weights_view.get_buff(),
                           dtype_to_mpi(self.proc_weights_view.dtype)],
-                          gath_proc_weights.get_buff(),
+                          gath_proc_weights_buff,
                           root=self.root)
+
+        for i, ary in enumerate(data):
+            self.comm.Gatherv(sendbuf=[ary.get_buff(),
+                                       dtype_to_mpi(ary.dtype)],
+                              recvbuf=[gath_data_buff[i], nobjs_to_get, displs,
+                                       dtype_to_mpi(ary.dtype)],
+                              root=self.root)
 
         self.gids_view = gath_gids
         self.weights_view = gath_weights
-        self.coords_view = gath_coords
         self.proc_weights_view = gath_proc_weights
+        self.procs_view = gath_procs
+        if self.rank == self.root:
+            self.coords_view = gath_coords
+        else:
+            self.coords_view = []
 
         self.all_exec_times = np.zeros(self.size, dtype=np.float32)
         self.all_exec_nobjs = np.zeros(self.size, dtype=np.int32)
+
+        return gath_data
 
     def adjust_proc_weights(self, exec_time, exec_nobjs, exec_count):
         # set new proc weights based on exec times
         # send all times to root
         scale_fac = self.total_num_objs * (exec_time / exec_nobjs)
 
-        self.lb.comm.Gather(np.array(exec_time, dtype=np.float32),
+        self.comm.Gather(np.array(exec_time, dtype=np.float32),
                             self.all_exec_times, root=self.root)
 
-        self.lb.comm.Gather(np.array(exec_nobjs, dtype=np.int32),
+        self.comm.Gather(np.array(exec_nobjs, dtype=np.int32),
                             self.all_exec_nobjs, root=self.root)
 
         if self.rank == self.root:
@@ -212,6 +308,7 @@ class RCB(object):
                     (self.total_num_objs * exec_count)
             scale_fac = 1. / np.sum(eff_weights / self.all_exec_times)
             proc_weights = scale_fac * eff_weights / self.all_exec_times
+            proc_weights = proc_weights.astype(np.float32)
 
             self.proc_weights = wrap(proc_weights, backend=self.backend)
             self.proc_weights_view = self.proc_weights.get_view()
@@ -219,7 +316,7 @@ class RCB(object):
     def migrate_objects(self):
         pass
 
-    def load_balance(self):
+    def load_balance_raw(self):
         # FIXME: These tags might mess with other sends and receives
         reqs_coords = []
         req_objids = None
@@ -265,7 +362,7 @@ class RCB(object):
                                         source=self.parent, tag=self.tag + 5)
 
             self.weights_view = carr.empty(self.nrecv_coords, self.dtype,
-                                      backend=self.backend)
+                                           backend=self.backend)
 
             req_w = self.comm.Irecv(self.weights_view.get_buff(),
                                     source=self.parent, tag=self.tag + 6)
@@ -274,8 +371,9 @@ class RCB(object):
                 x = carr.empty(self.nrecv_coords, self.dtype,
                                backend=self.backend)
                 reqs_coords.append(self.comm.Irecv(x.get_buff(),
-                                 source=self.parent, tag=self.tag + 7 + i))
+                                   source=self.parent, tag=self.tag + 7 + i))
                 self.coords_view.append(x)
+
 
             req_max = self.comm.Irecv(self.max, source=self.parent,
                                       tag=self.tag + 10)
@@ -377,6 +475,9 @@ class RCB(object):
             self.weights_view.resize(target_idx)
 
         self.num_objs = self.gids_view.length
+
+    def load_balance(self):
+        self.load_balance_raw()
         self.make_comm_plan()
 
     def point_assign(self, point):
@@ -399,10 +500,16 @@ class RCB(object):
         if self.rank == self.root:
             self.total_num_objs = np.sum(self.nobjs_per_proc,
                                          dtype=self.gids_view.dtype)
-            self.all_gids = np.empty(self.total_num_objs, np.int32)
+            self.all_gids = carr.empty(self.total_num_objs, np.int32,
+                                       backend=self.backend)
+            all_gids_buff = self.all_gids.get_buff()
+            displs = np.zeros(self.size, dtype=np.int32)
+            np.cumsum(self.nobjs_per_proc[:-1], out=displs[1:])
         else:
             self.total_num_objs = np.array(0, dtype=self.gids_view.dtype)
             self.all_gids = None
+            all_gids_buff = None
+            displs = None
 
         self.comm.Bcast(self.total_num_objs, root=self.root)
 
@@ -416,23 +523,24 @@ class RCB(object):
 
         self.comm.Gatherv(sendbuf=[self.gids_view.get_buff(),
                                    dtype_to_mpi(self.gids_view.dtype)],
-                          recvbuf=[self.all_gids, self.nobjs_per_proc],
+                          recvbuf=[all_gids_buff, self.nobjs_per_proc, displs,
+                                   dtype_to_mpi(self.gids_view.dtype)],
                           root=self.root)
 
-        proclist = []
-        if self.rank == self.root:
-            procstart_ids = np.zeros(self.size, dtype=np.int32)
-
-            np.cumsum(self.nobjs_per_proc[:-1], out=procstart_ids[1:])
-
-            proclist = np.empty(self.total_num_objs, dtype=np.int32)
-
-            for proc in range(self.size):
-                start = procstart_ids[proc]
-                proclist[start:start + self.nobjs_per_proc[proc]] = proc
-
         # FIXME: tag
-        self.plan = Comm(proclist, sorted=True, root=self.root, tag=self.tag)
+        self.plan = CommBase(None, sorted=True, root=self.root, tag=self.tag)
+        procs_from = np.array([0], dtype=np.int32)
+        lengths_from = np.array([self.num_objs], dtype=np.int32)
+
+        if self.rank == self.root:
+            procs_to = np.arange(0, self.size, dtype=np.int32)
+            lengths_to = self.nobjs_per_proc
+        else:
+            procs_to = np.array([], dtype=np.int32)
+            lengths_to = np.array([], dtype=np.int32)
+
+        self.plan.set_send_info(procs_to, lengths_to)
+        self.plan.set_recv_info(procs_from, lengths_from)
 
     def comm_do_post(self, senddata, recvdata):
         self.plan_recvs.append(recvdata)
@@ -443,3 +551,370 @@ class RCB(object):
 
     def comm_do(self, senddata, recvdata):
         self.plan.comm_do(senddata, recvdata)
+
+
+@memoize(key=lambda *args: tuple(args))
+def get_elwise(f, backend):
+    return Elementwise(f, backend=backend)
+
+
+@memoize(key=lambda *args: tuple(args))
+def get_scan(inp_f, out_f, dtype, backend):
+    return Scan(input=inp_f, output=out_f, dtype=dtype,
+                backend=backend)
+
+
+@annotate
+def flatten1(x, ncells_per_dim):
+    res = declare('long')
+    return res
+
+
+@annotate
+def flatten3(x, y, z, ncells_per_dim):
+    ncx = ncells_per_dim[0]
+    ncy = ncells_per_dim[1]
+    res = declare('long')
+    res = x + ncx * y + ncx * ncy * z
+    return res
+
+
+@annotate
+def unflatten1(key, cid, ncells_per_dim):
+    cid[0] = cast(key, 'int')
+
+
+@annotate
+def unflatten2(key, cid, ncells_per_dim):
+    ncx = ncells_per_dim[0]
+    cid[1] = cast(key / ncx, 'int')
+    cid[0] = cast(key - cid[1] * ncx, 'int')
+
+
+@annotate
+def unflatten3(key, cid, ncells_per_dim):
+    ncx = ncells_per_dim[0]
+    ncy = ncells_per_dim[1]
+    cid[2] = cast(key / (ncx * ncy), 'int')
+    cid[1] = cast((key - cid[2] * ncx * ncy) / ncx, 'int')
+    cid[0] = cast(key - cid[1] * ncx - cid[2] * ncy * ncx, 'int')
+
+
+@annotate
+def flatten2(x, y, ncells_per_dim):
+    ncx = ncells_per_dim[0]
+    res = declare('long')
+    res = x + ncx * y
+    return res
+
+
+class FillKeys(Template):
+    def __init__(self, name, ndims):
+        super(FillKeys, self).__init__(name=name)
+        self.ndims = ndims
+        self.args = []
+        for i in range(self.ndims):
+            self.args.append('x%s' % i)
+        self.int_args = ['c%s' % j for j in range(self.ndims)]
+        self.int_args = ', '.join(self.int_args)
+
+    def extra_args(self):
+        min_args = ['%smin' % arg for arg in self.args]
+        return self.args + min_args, {}
+
+    def template(self, i, keys, bin_size, ncells_per_dim):
+        '''
+        ncells_per_dim = declare('matrix(${obj.ndims}), int')
+        % for j, x in enumerate(obj.args)
+        c${j} = floor((${x}[i] - ${x}min) / bin_size)
+        % endfor
+        keys[i] = flatten${obj.ndims}(${obj.int_args}, ncells_per_dim)
+        '''
+
+
+@memoize(key=lambda *args: tuple(args))
+def get_fill_keys_kernel(ndims, backend):
+    fill_keys = FillKeys('fill_keys', ndims).function
+    fill_keys_knl = get_elwise(fill_keys, backend)
+    return fill_keys_knl
+
+
+@annotate
+def inp_fill_centroids(i, keys):
+    return 1 if i != 0 and keys[i] != keys[i - 1] else 0
+
+
+class OutFillCentroids(Template):
+    def __init__(self, name, ndims):
+        super(OutFillCentroids, self).__init__(name=name)
+        self.ndims = ndims
+        self.args = []
+        for i in range(self.ndims):
+            self.args.append('centroid%s' % i)
+
+    def extra_args(self):
+        coord_names = ['x%s' % i for in range(self.ndims)]
+        min_args = ['%smin' % arg for arg in coord_names]
+        return self.args, {}
+
+    def template(self, i, item, prev_item, ncells_per_dim,
+                 bin_size, cell_to_key, cell_to_idx, cell_weights,
+                 key_to_idx, cell_num_objs):
+        '''
+        if i == 0 or item != prev_item:
+            key = keys[i]
+            cids = declare('matrix(${obj.ndims}), int')
+            unflatten${obj.ndims}(keys[i], cids, ncells_per_dim)
+            % for dim in range(obj.ndims)
+            centroid${dim}[item] = x${dim}min + bin_size * (0.5 + cids[${dim}])
+            % endfor
+            cell_to_key[item] = key
+            cell_to_idx[item] = i
+            key_to_idx[key] = i
+        cell_weights[item] += weights[i]
+        cell_num_objs[item] += 1
+        '''
+
+
+@annotate
+def fill_cell_weights(i, cell_to_idx, cell_weights, cell_num_objs, weights,
+                      num_cells):
+    start = cell_to_idx[i]
+    if i < num_cells - 1:
+        end = cell_to_idx[i + 1]
+    else:
+        end = num_cells
+    num_objs = end - start
+
+    tot_weight = 0.
+    for j in range(num_objs):
+        tot_weight += weights[start + j]
+
+    cell_num_objs[i] = num_objs
+    cell_weights[i] = tot_weight
+
+
+@memoize(key=lambda *args: tuple(args))
+def get_fill_centroids_kernel(ndims, backend):
+    out_fill_centroids = OutFillCentroids(
+            'out_fill_centroids', ndims
+            ).function
+    fill_centroids_knl = get_scan(inp_fill_centroids, out_fill_centroids,
+                                  np.uint64, backend)
+    return fill_centroids_knl
+
+
+@annotate
+def map_key_to_idx(i, keys, key_to_idx):
+    key = keys[i]
+
+    if i != 0 and key == keys[i - 1]:
+        return
+
+    key_to_idx[key] = i
+
+
+class BinnedRCB(object):
+    def __init__(self, ndims, dtype, coords=[], gids=None, weights=None,
+                 proc_weights=None, bin_size=None, root=0, tag=111,
+                 backend=None):
+        self.comm = mpi.COMM_WORLD
+        self.rank = self.comm.Get_rank()
+        self.size = self.comm.Get_size()
+        self.root = root
+        self.backend = get_backend(backend)
+        self.coords = coords
+        self.gids = gids
+        self.ndims = ndims
+        self.weights = weights
+        self.proc_weights = proc_weights
+        self.out_list = None
+        self.tag = tag
+        self.dtype = dtype
+        self.procs = None
+        self.plan_recvs = []
+        self.plan_transfers = []
+
+        if self.gids and self.gids.dtype != np.int32:
+            raise TypeError("gids should be of type int32 and not %s" % \
+                            self.gids.dtype)
+
+        if self.rank == self.root:
+            self.procs = carr.arange(0, self.size, 1, dtype=np.int32,
+                                     backend=self.backend)
+
+        if self.rank == self.root and self.gids is None:
+            nobjs = self.coords[0].length
+            self.gids = carr.arange(0, nobjs, 1, dtype=np.int32,
+                                    backend=self.backend)
+
+        if self.rank == self.root and self.weights is None:
+            ndata = self.gids.length
+            self.weights = carr.empty(ndata, np.float32,
+                                      backend=self.backend)
+            self.weights.fill(1. / ndata)
+        elif self.rank == self.root:
+            self.weights.dev /= carr.sum(self.weights)
+
+        if self.rank == self.root and self.proc_weights is None:
+            self.proc_weights = carr.empty(self.size, np.float32,
+                                           backend=self.backend)
+            self.proc_weights.fill(1. / self.size)
+
+        # views of original arrays
+        self.procs_view = self.procs.get_view() if self.procs else None
+        self.proc_weights_view = self.proc_weights.get_view() \
+                if self.proc_weights else None
+        self.weights_view = self.weights.get_view() if self.weights else None
+        self.gids_view = self.gids.get_view() \
+                if self.gids else None
+        self.coords_view = [x.get_view() for x in self.coords] if self.coords else []
+
+        self.max = np.zeros(self.ndims, dtype=self.dtype)
+        self.min = np.zeros(self.ndims, dtype=self.dtype)
+
+        if self.coords_view:
+            update_minmax(self.coords_view)
+
+        for i, x in enumerate(self.coords_view):
+            self.max[i] = x.maximum
+            self.min[i] = x.minimum
+
+        self.centroids = [None] * self.ndims
+
+        self.bin_size = bin_size
+        self.bin()
+
+    def bin(self):
+        fill_keys_knl = get_fill_keys_knl(self.ndims, self.backend)
+        fill_centroids_knl = get_fill_centroids_kernel(ndims, self.backend)
+        fill_cell_weights_knl = get_elwise('fill_cell_weights',
+                                           backend=self.backend)
+
+        self.keys = carr.empty(self.gids_view.length, np.int64,
+                               backend=self.backend)
+
+        fill_keys_args = [self.keys] + self.coords_view + list(self.min)
+
+        fill_keys_knl(*fill_keys_args)
+
+        # sort
+        inp_list = [self.keys, self.gids_view] + self.coords_view
+        out_list = carr.sort_by_keys(inp_list, backend=self.backend)
+        self.keys, self.gids_view = out_list[0], out_list[1]
+        self.coords_view = out_list[2:]
+
+        self.key_to_idx = carr.zeros(1 + int(self.keys[-1]), np.int32,
+                                     backend=self.backend)
+
+        num_cids_knl = Reduction('a+b', map_func=inp_fill_centroids,
+                                 dtype_out=np.int32, backend=self.backend)
+
+        num_cids = int(num_cids_knl(self.keys))
+
+        self.cell_to_key = carr.empty(num_cids, np.int64,
+                                      backend=self.backend)
+        self.cell_to_idx = carr.empty(num_cids, np.int32,
+                                       backend=self.backend)
+        self.cell_weights = carr.empty(num_cids, np.float32,
+                                       backend=self.backend)
+        for dim in range(self.ndims):
+            self.centroids[dim] = carr.empty(num_cids, self.dtype,
+                                             backend=self.backend)
+
+        ncells_per_dim = np.empty(self.ndims, dtype=np.int32)
+
+        for i in range(self.ndims):
+            ncells_per_dim[i] = \
+                    np.ceil((self.max[i] - self.min[i]) / self.bin_size)
+
+        ncells_per_dim = wrap(ncells_per_dim, backend=self.backend)
+
+        fill_centroids_args = {'keys': self.keys,
+                'ncells_per_dim': ncells_per_dim,
+                'bin_size': bin_size, 'cell_to_key': self.cell_to_key,
+                'cell_weights': self.cell_weights,
+                'key_to_idx': self.key_to_idx,
+                'cell_to_idx': self.cell_to_idx}
+
+        for dim in range(self.ndims):
+            arg_name = 'x%s' % dim
+            min_arg_name = 'x%smin' % dim
+            cen_arg_name = 'centroid%s' % dim
+            fill_centroids_args[arg_name] = self.coords_view[dim]
+            fill_centroids_args[min_arg_name] = self.min[dim]
+            fill_centroids_args[cen_arg_name] = self.centroids[dim]
+
+        fill_centroids_knl(**fill_centroids_args)
+
+        self.cids = carr.arange(0, num_cids, 1, np.int32,
+                                backend=self.backend)
+
+        self.rcb = RCB(self.ndims, self.dtype, coords=self.centroids,
+                       gids=self.cids, weights=self.cell_weights,
+                       proc_weights=self.proc_weights, root=self.root,
+                       tag=self.tag, backend=self.backend)
+
+    def load_balance_raw(self):
+        self.rcb.load_balance_raw()
+
+    def load_balance(self):
+        self.load_balance_raw()
+        self.make_comm_plan()
+
+    def make_comm_plan(self):
+        # Send object ids back to root
+        self.ncells_per_proc = None
+        if self.rank == self.root:
+            self.ncells_per_proc = np.zeros(self.size,
+                                            dtype=self.rcb.gids_view.dtype)
+
+        self.comm.Gather(np.array(self.rcb.num_objs, dtype=np.int32),
+                         self.ncells_per_proc, root=self.root)
+
+        if self.rank == self.root:
+            self.total_num_cells = np.sum(self.ncells_per_proc,
+                                         dtype=self.rcb.gids_view.dtype)
+            self.all_cids = carr.empty(self.total_num_cells, np.int32,
+                                       backend=self.backend)
+            all_cids_buff = self.all_cids.get_buff()
+            displs = np.zeros(self.size, dtype=np.int32)
+            np.cumsum(self.ncells_per_proc[:-1], out=displs[1:])
+        else:
+            self.total_num_cells = np.array(0, dtype=self.gids_view.dtype)
+            self.all_cids = None
+            all_cids_buff = None
+            displs = None
+
+        self.comm.Bcast(self.total_num_cells, root=self.root)
+
+        self.maxs = carr.empty(self.ndims * self.size, self.dtype,
+                               backend=self.backend)
+        self.mins = carr.empty(self.ndims * self.size, self.dtype,
+                               backend=self.backend)
+
+        self.comm.Allgather(self.max, self.maxs.get_buff())
+        self.comm.Allgather(self.min, self.mins.get_buff())
+
+        self.comm.Gatherv(sendbuf=[self.rcb.gids_view.get_buff(),
+                                   dtype_to_mpi(self.rcb.gids_view.dtype)],
+                          recvbuf=[all_cids_buff, self.ncells_per_proc, displs,
+                                   dtype_to_mpi(self.rcb.gids_view.dtype)],
+                          root=self.root)
+
+        # FIXME: tag
+        self.plan = CommBase(None, sorted=True, root=self.root, tag=self.tag)
+        procs_from = np.array([0], dtype=np.int32)
+        lengths_from = np.array([self.rcb.num_objs], dtype=np.int32)
+
+        if self.rank == self.root:
+            procs_to = np.arange(0, self.size, dtype=np.int32)
+            lengths_to = self.ncells_per_proc
+        else:
+            procs_to = np.array([], dtype=np.int32)
+            lengths_to = np.array([], dtype=np.int32)
+
+        self.plan.set_send_info(procs_to, lengths_to)
+        self.plan.set_recv_info(procs_from, lengths_from)
+
+

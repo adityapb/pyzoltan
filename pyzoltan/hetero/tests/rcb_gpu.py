@@ -21,14 +21,14 @@ ctx = dev.make_context()
 atexit.register(ctx.pop)
 
 if rank == 0:
-    numObjectsTotal = 1 << 10
+    numObjectsTotal = 100
 
     print("Total num objects = %s" % numObjectsTotal)
 
     x = random.random(numObjectsTotal)
     x = x.astype(np.float32)
     gids = np.arange(numObjectsTotal)
-    gids = gids.astype(np.uint32)
+    gids = gids.astype(np.int32)
     gids = wrap_array(gids, backend='cuda')
     x = wrap_array(x, backend='cuda')
 
@@ -38,12 +38,14 @@ if rank == 0:
     proc_weights[1] = 0.55
 
 if rank == 0:
-    rcb = RCB(1, np.float32, data=[x], object_ids=gids, backend='cuda',
+    rcb = RCB(1, np.float32, coords=[x], gids=gids, backend='cuda',
               proc_weights=proc_weights)
 else:
     rcb = RCB(1, np.float32, backend='cuda')
 
 rcb.load_balance()
 
-print("After lb, rank %s = %s" % (rank, rcb.object_ids_view.length))
+print("After lb, rank %s = %s" % (rank, rcb.gids_view.length))
+
+print("%s %s" % (rank, np.sort(rcb.gids_view.get())))
 
