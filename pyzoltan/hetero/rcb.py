@@ -139,16 +139,6 @@ class RCB(object):
                 if self.gids else None
         self.coords_view = [x.get_view() for x in self.coords] if self.coords else []
 
-        self.max = np.zeros(self.ndims, dtype=self.dtype)
-        self.min = np.zeros(self.ndims, dtype=self.dtype)
-
-        if self.coords_view:
-            update_minmax(self.coords_view)
-
-        for i, x in enumerate(self.coords_view):
-            self.max[i] = x.maximum
-            self.min[i] = x.minimum
-
     def _partition_procs(self):
         # NOTE: This can be made better using the weights
         # of the procs and communication costs
@@ -380,6 +370,18 @@ class RCB(object):
         req_objids = None
         req_w = None
         req_max, req_min = None, None
+
+        if self.rank == self.root:
+            self.max = np.zeros(self.ndims, dtype=self.dtype)
+            self.min = np.zeros(self.ndims, dtype=self.dtype)
+
+            if self.coords_view:
+                update_minmax(self.coords_view)
+
+            for i, x in enumerate(self.coords_view):
+                self.max[i] = x.maximum
+                self.min[i] = x.minimum
+
         if self.rank != self.root:
             status = mpi.Status()
             nrecv_coords = np.empty(1, dtype=np.int32)
