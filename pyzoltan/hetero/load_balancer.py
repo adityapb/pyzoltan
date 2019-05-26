@@ -92,15 +92,20 @@ class LoadBalancer(object):
         self.data = list(kwargs.values())
         self.data = [] if all(v is None for v in self.data) else \
                         self.data
+        self.local_data = [None] * len(self.data_names)
+
+    def set_lbfreq(self, lbfreq):
+        self.lbfreq = lbfreq
 
     def add_data(self, ary, name):
         self.data_names.append(name)
         self.data.append(ary)
 
-    def gather(self):
-        data = [getattr(self.lb_data, x) for x in self.data_names]
-        gath_data = self.lb_obj.gather(data)
-        for i, x in enumerate(gath_data):
+    def update_lb_data(self, data=None):
+        if not data:
+            data = self.local_data
+
+        for i, x in enumerate(data):
             setattr(self.lb_data, self.data_names[i], x)
 
         for i, x in enumerate(self.lb_obj.coords_view):
@@ -111,6 +116,10 @@ class LoadBalancer(object):
         setattr(self.lb_data, 'proc_weights', self.lb_obj.proc_weights_view)
         setattr(self.lb_data, 'num_objs', self.lb_obj.num_objs)
 
+    def gather(self):
+        gath_data = self.lb_obj.gather(self.local_data)
+        self.update_lb_data(data=gath_data)
+
     def load_balance(self):
         if not self.lb_obj:
             self.lb_obj = self.algorithm(self.ndims, self.dtype, coords=self.coords,
@@ -119,10 +128,8 @@ class LoadBalancer(object):
                                      root=self.root, backend=self.backend)
 
         if self.lb_count:
-            data = [getattr(self.lb_data, x) for x in self.data_names]
-            self.lb_obj.gather(data)
+            self.lb_obj.gather(self.local_data)
 
-        # NOTE: Possible deadlock if some process doesn't enter this block
         if self.exec_count:
             self.lb_obj.adjust_proc_weights(self.exec_time, self.exec_nobjs,
                                         self.exec_count)
@@ -149,17 +156,21 @@ class LoadBalancer(object):
             else:
                 recvdata = None
             self.lb_obj.comm_do(senddata, recvdata)
-            setattr(self.lb_data, self.data_names[i], recvdata)
+            self.local_data[i] = recvdata
 
-        for i, name in enumerate(self.coord_names):
-            setattr(self.lb_data, name, self.lb_obj.coords_view[i])
-
-        setattr(self.lb_data, 'gids', self.lb_obj.gids_view)
-        setattr(self.lb_data, 'weights', self.lb_obj.weights_view)
-        setattr(self.lb_data, 'proc_weights', self.lb_obj.proc_weights_view)
-        setattr(self.lb_data, 'num_objs', self.lb_obj.num_objs)
+        self.update_lb_data()
 
         self.exec_time = 0.
         self.exec_nobjs = 0
         self.exec_count = 0
         self.lb_count += 1
+
+    def update(self, migrate=True):
+        if self.lb_count % self.lbfreq == 0:
+            self.load_balance()
+            self.update_lb_data()
+        elif migrate:
+            data = [getattr(self.lb_data, x) for x in self.data_names]
+            self.lb_obj.migrate_objects(data)
+            self.update_lb_data()
+

@@ -2,7 +2,9 @@ import mpi4py.MPI as mpi
 import numpy as np
 import compyle.array as carr
 from compyle.array import get_backend
-from compyle.types import NP_TYPE_LIST
+from compyle.types import annotate, NP_TYPE_LIST
+from compyle.parallel import Elementwise, Reduction, Scan
+from pytools import memoize
 
 
 def dbg_print(msg):
@@ -34,6 +36,7 @@ class CommBase(object):
         self.proclist = proclist
         self.tag = tag
         self.blocked_senddata = None
+        self.requests = []
 
     def set_send_info(self, procs_to, lengths_to):
         self.nblocks = len(procs_to)
@@ -61,10 +64,10 @@ class CommBase(object):
         else:
             senddtype = -1
 
-        self.requests = [None for i in range(self.nrecvs)]
+        requests = [None for i in range(self.nrecvs)]
 
         for i in range(self.nrecvs):
-            self.requests[i] = self.comm.Irecv(
+            requests[i] = self.comm.Irecv(
                     recvdtype[i:i+1], source=self.procs_from[i],
                     tag=self.tag
                     )
@@ -73,7 +76,7 @@ class CommBase(object):
             self.comm.Send(np.array(senddtype, dtype=np.int32),
                            dest=self.procs_to[i], tag=self.tag)
 
-        mpi.Request.Waitall(self.requests)
+        mpi.Request.Waitall(requests)
 
         if not np.all(recvdtype == recvdtype[0]):
             raise ValueError("All sends should have same datatype")
@@ -106,8 +109,6 @@ class CommBase(object):
         else:
             self.blocked_senddata = senddata
 
-        self.requests = []
-
         for i in range(self.nrecvs):
             start = self.start_from[i]
             length = self.lengths_from[i]
@@ -133,10 +134,45 @@ class CommBase(object):
     def comm_do_wait(self):
         if self.requests:
             mpi.Request.Waitall(self.requests)
+            self.requests = []
 
     def comm_do(self, senddata, recvdata):
         self.comm_do_post(senddata, recvdata)
         self.comm_do_wait()
+
+
+@annotate
+def inp_unique_procs(i, proclist):
+    return 1 if i == 0 or proclist[i] != proclist[i - 1] else 0
+
+
+@annotate
+def out_unique_procs(i, item, prev_item, proclist, procs_to, starts):
+    if item != prev_item:
+        procs_to[item - 1] = proclist[i]
+        starts[item - 1] = i
+
+
+@annotate
+def find_lengths_from_starts(i, starts, lengths_to, num_procs, num_objs):
+    start = starts[i]
+    if i == num_procs - 1:
+        end = num_objs
+    else:
+        end = starts[i + 1]
+
+    lengths_to[i] = end - start
+
+
+@memoize(key=lambda *args: tuple(args))
+def get_elwise(f, backend):
+    return Elementwise(f, backend=backend)
+
+
+@memoize(key=lambda *args: tuple(args))
+def get_scan(inp_f, out_f, dtype, backend):
+    return Scan(input=inp_f, output=out_f, dtype=dtype,
+                backend=backend)
 
 
 class Comm(CommBase):
@@ -144,21 +180,38 @@ class Comm(CommBase):
         super(Comm, self). __init__(proclist, tag=tag, root=root,
                                     backend=backend, sorted=sorted)
         if len(self.proclist) > 0:
+            if isinstance(self.proclist, np.ndarray):
+                self.proclist = wrap_array(self.proclist,
+                                           backend=self.backend)
             if not self.sorted:
-                self.order = carr.wrap_array(self._sort_proclist(),
-                                             backend=self.backend)
-            starts, procs_to, lengths_to = [0], [proclist[0]], [1]
-            for i in range(1, self.nsends):
-                if proclist[i] != proclist[i-1]:
-                    starts.append(i)
-                    procs_to.append(proclist[i])
-                    lengths_to.append(1)
-                else:
-                    lengths_to[-1] += 1
-            self.starts = np.array(starts, dtype=np.int32)
-            self.procs_to = np.array(procs_to, dtype=np.int32)
-            self.lengths_to = np.array(lengths_to, dtype=np.int32)
-            self.nblocks = self.procs_to.size
+                self.order = self._sort_proclist()
+
+            num_procs_knl = Reduction(
+                    'a+b', dtype_out=np.int32, map_func=inp_unique_procs,
+                    backend=self.backend
+                    )
+
+            self.nblocks = int(num_procs_knl(self.proclist))
+
+            starts = carr.empty(self.nblocks, np.int32, backend=self.backend)
+            procs_to = carr.empty(self.nblocks, np.int32, backend=self.backend)
+            lengths_to = carr.empty(self.nblocks, np.int32, backend=self.backend)
+
+            unique_procs_knl = get_scan(inp_unique_procs, out_unique_procs,
+                                        np.int32, self.backend)
+
+            unique_procs_knl(proclist=self.proclist, procs_to=procs_to,
+                             starts=starts)
+
+            find_lengths_from_starts_knl = get_elwise(find_lengths_from_starts,
+                                                     backend=self.backend)
+
+            find_lengths_from_starts_knl(starts, lengths_to, self.nblocks,
+                                         len(proclist))
+
+            self.starts = np.array(starts.get(), dtype=np.int32)
+            self.procs_to = np.array(procs_to.get(), dtype=np.int32)
+            self.lengths_to = np.array(lengths_to.get(), dtype=np.int32)
         else:
             self.starts = np.empty(0, dtype=np.int32)
             self.procs_to = np.empty(0, dtype=np.int32)
@@ -167,14 +220,12 @@ class Comm(CommBase):
         self._comm_invert_map(tag, self.lengths_to, self.procs_to)
 
     def _sort_proclist(self):
-        order = np.argsort(self.proclist)
-        self.proclist = self.proclist[order]
-        return order
+        return carr.argsort(self.proclist)
 
     def _comm_invert_map(self, tag, lengths_to, procs_to):
         status = mpi.Status()
         msg_count = np.zeros(self.size, dtype=np.int32)
-        counts = np.ones_like(msg_count)
+        counts = np.zeros_like(msg_count)
         nrecvs = np.zeros(1, dtype=np.int32)
 
         for proc in procs_to:
@@ -187,10 +238,10 @@ class Comm(CommBase):
         self.lengths_from = np.zeros(self.nrecvs, dtype=np.int32)
         self.procs_from = np.zeros_like(self.lengths_from)
 
-        self.requests = [None for i in range(self.nrecvs)]
+        requests = [None for i in range(self.nrecvs)]
 
         for i in range(self.nrecvs):
-            self.requests[i] = self.comm.Irecv(
+            requests[i] = self.comm.Irecv(
                     self.lengths_from[i:i+1], source=mpi.ANY_SOURCE, tag=tag
                     )
 
@@ -198,9 +249,7 @@ class Comm(CommBase):
             self.comm.Send(np.array(lengths_to[i]), dest=procs_to[i], tag=tag)
 
         for i in range(self.nrecvs):
-            self.requests[i].Wait(status=status)
+            requests[i].Wait(status=status)
             self.procs_from[i] = status.Get_source()
 
         self.set_recv_info(self.procs_from, self.lengths_from)
-
-

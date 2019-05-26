@@ -3,9 +3,9 @@ import numpy as np
 import compyle.array as carr
 from compyle.array import get_backend, wrap, update_minmax
 from compyle.api import annotate
-from compyle.parallel import Scan
+from compyle.parallel import Scan, Reduction, Elementwise
 from compyle.template import Template
-from pyzoltan.hetero.comm import Comm, CommBase, dtype_to_mpi
+from pyzoltan.hetero.comm import Comm, CommBase, dtype_to_mpi, get_elwise, get_scan
 from pytools import memoize
 
 
@@ -33,6 +33,11 @@ def out_partition_domain(i, item, prev_item, target_w, target_idx):
         target_idx[0] = i
 
 
+@annotate
+def count_nsends(i, new_proc, self_proc):
+    return 1 if new_proc[i] != self_proc else 0
+
+
 class PointAssign(Template):
     def __init__(self, name, ndims):
         super(PointAssign, self).__init__(name=name)
@@ -44,22 +49,21 @@ class PointAssign(Template):
     def extra_args(self):
         return self.args, {}
 
-    def template(self, i, keys, bin_size):
+    def template(self, i, new_proc, mins, maxs, size):
         '''
         for j in range(size):
             count = 0
-            proc = procs[j]
 
-            % for dim in range(obj.ndims)
-            pmax_dim = maxs[proc * ndims + dim]
-            pmin_dim = mins[proc * ndims + dim]
+            % for dim in range(obj.ndims):
+            pmax_dim = maxs[j * ${obj.ndims} + ${dim}]
+            pmin_dim = mins[j * ${obj.ndims} + ${dim}]
 
             if x${dim}[i] <= pmax_dim and x${dim}[i] >= pmin_dim:
                 count += 1
             % endfor
 
             if count == ${obj.ndims}:
-                new_proc[i] = proc
+                new_proc[i] = j
                 return
         '''
 
@@ -95,6 +99,10 @@ class RCB(object):
         self.procs = None
         self.plan_recvs = []
         self.plan_transfers = []
+
+        self.point_assign_f = PointAssign('point_assign', self.ndims).function
+        self.point_assign_knl = Elementwise(self.point_assign_f,
+                                            backend=self.backend)
 
         if self.gids and self.gids.dtype != np.int32:
             raise TypeError("gids should be of type int32 and not %s" % \
@@ -313,8 +321,58 @@ class RCB(object):
             self.proc_weights = wrap(proc_weights, backend=self.backend)
             self.proc_weights_view = self.proc_weights.get_view()
 
-    def migrate_objects(self):
-        pass
+    def make_migrate_plan(self):
+        new_proc = carr.empty(self.num_objs, np.int32, backend=self.backend)
+        self.point_assign_knl(new_proc, self.mins, self.maxs,
+                              self.size, *self.coords_view)
+        self.migrate_plan = Comm(new_proc, root=self.root, backend=self.backend)
+        return new_proc
+
+    def migrate_objects(self, data):
+        new_proc = self.make_migrate_plan()
+
+        count_nsends_knl = Reduction('a+b', map_func=count_nsends,
+                                     dtype_out=np.int32, backend=self.backend)
+
+        nsends = int(count_nsends_knl(new_proc, self.rank))
+
+        new_len = self.migrate_plan.nreturn
+        # gids, weights, coords, data
+
+        if nsends == 0 and new_len == self.num_objs:
+            return
+
+        new_coords = []
+        new_data = []
+
+        new_gids = carr.empty(new_len, self.gids_view.dtype, backend=self.backend)
+        new_weights = carr.empty(new_len, self.weights_view.dtype, backend=self.backend)
+        for i, x in enumerate(self.coords_view):
+            new_coords.append(carr.empty(new_len, x.dtype,
+                                         backend=self.backend))
+
+        for i, x in enumerate(data):
+            new_data.append(carr.empty(new_len, x.dtype, backend=self.backend))
+
+        self.migrate_plan.comm_do_post(self.gids_view, new_gids)
+        self.migrate_plan.comm_do_post(self.weights_view, new_weights)
+
+        for i, x in enumerate(self.coords_view):
+            self.migrate_plan.comm_do_post(x, new_coords[i])
+
+        for i, x in enumerate(data):
+            self.migrate_plan.comm_do_post(x, new_data[i])
+
+        self.migrate_plan.comm_do_wait()
+
+        self.gids_view.set_data(new_gids)
+        self.weights_view.set_data(new_weights)
+        for i, x_new in enumerate(new_coords):
+            self.coords_view[i].set_data(x_new)
+        for i, x_new in enumerate(new_data):
+            data[i].set_data(x_new)
+
+        self.num_objs = int(new_len)
 
     def load_balance_raw(self):
         # FIXME: These tags might mess with other sends and receives
@@ -390,7 +448,6 @@ class RCB(object):
                 req_max.Wait()
                 req_min.Wait()
                 req_w.Wait()
-                self.make_comm_plan()
                 return
 
         while self.procs_view.length != 1:
@@ -431,7 +488,7 @@ class RCB(object):
 
             part_dim = self.coords_view[maxlen_idx]
             new_max = part_dim[target_idx - 1]
-            new_min = part_dim[target_idx]
+            new_min = part_dim[target_idx - 1]
 
             self.max[maxlen_idx] = new_max
             right_min[maxlen_idx] = new_min
@@ -479,14 +536,6 @@ class RCB(object):
     def load_balance(self):
         self.load_balance_raw()
         self.make_comm_plan()
-
-    def point_assign(self, point):
-        for proc in self.size:
-            proc_max = self.maxs[proc * self.ndims: (proc + 1) * self.ndims]
-            proc_min = self.mins[proc * self.ndims: (proc + 1) * self.ndims]
-
-            if np.all(point <= proc_max) and np.all(point >= proc_min):
-                return proc
 
     def make_comm_plan(self):
         # Send object ids back to root
@@ -551,17 +600,6 @@ class RCB(object):
 
     def comm_do(self, senddata, recvdata):
         self.plan.comm_do(senddata, recvdata)
-
-
-@memoize(key=lambda *args: tuple(args))
-def get_elwise(f, backend):
-    return Elementwise(f, backend=backend)
-
-
-@memoize(key=lambda *args: tuple(args))
-def get_scan(inp_f, out_f, dtype, backend):
-    return Scan(input=inp_f, output=out_f, dtype=dtype,
-                backend=backend)
 
 
 @annotate
@@ -653,13 +691,12 @@ class OutFillCentroids(Template):
             self.args.append('centroid%s' % i)
 
     def extra_args(self):
-        coord_names = ['x%s' % i for in range(self.ndims)]
+        coord_names = ['x%s' % i for i in range(self.ndims)]
         min_args = ['%smin' % arg for arg in coord_names]
         return self.args, {}
 
     def template(self, i, item, prev_item, ncells_per_dim,
-                 bin_size, cell_to_key, cell_to_idx, cell_weights,
-                 key_to_idx, cell_num_objs):
+                 bin_size, cell_to_key, cell_to_idx, key_to_idx):
         '''
         if i == 0 or item != prev_item:
             key = keys[i]
@@ -671,8 +708,6 @@ class OutFillCentroids(Template):
             cell_to_key[item] = key
             cell_to_idx[item] = i
             key_to_idx[key] = i
-        cell_weights[item] += weights[i]
-        cell_num_objs[item] += 1
         '''
 
 
@@ -694,6 +729,23 @@ def fill_cell_weights(i, cell_to_idx, cell_weights, cell_num_objs, weights,
     cell_weights[i] = tot_weight
 
 
+@annotate
+def inp_fill_gids_from_cids(i, cell_num_objs):
+    cid = all_cids[i]
+    return cell_num_objs[cid]
+
+
+@annotate
+def out_fill_gids_from_cids(i, all_cids, all_gids, cell_to_idx,
+                            cell_num_objs, gids):
+    cid = all_cids[i]
+    start_idx = cell_to_idx[cid]
+    nobjs = cell_num_objs[cid]
+
+    for j in range(nobjs):
+        all_gids[prev_item + j] = gids[start_idx + j]
+
+
 @memoize(key=lambda *args: tuple(args))
 def get_fill_centroids_kernel(ndims, backend):
     out_fill_centroids = OutFillCentroids(
@@ -703,15 +755,6 @@ def get_fill_centroids_kernel(ndims, backend):
                                   np.uint64, backend)
     return fill_centroids_knl
 
-
-@annotate
-def map_key_to_idx(i, keys, key_to_idx):
-    key = keys[i]
-
-    if i != 0 and key == keys[i - 1]:
-        return
-
-    key_to_idx[key] = i
 
 
 class BinnedRCB(object):
@@ -766,9 +809,9 @@ class BinnedRCB(object):
         self.proc_weights_view = self.proc_weights.get_view() \
                 if self.proc_weights else None
         self.weights_view = self.weights.get_view() if self.weights else None
-        self.gids_view = self.gids.get_view() \
-                if self.gids else None
-        self.coords_view = [x.get_view() for x in self.coords] if self.coords else []
+        self.gids_view = self.gids.get_view() if self.gids else None
+        self.coords_view = [x.get_view() for x in self.coords] \
+                if self.coords else []
 
         self.max = np.zeros(self.ndims, dtype=self.dtype)
         self.min = np.zeros(self.ndims, dtype=self.dtype)
@@ -780,10 +823,19 @@ class BinnedRCB(object):
             self.max[i] = x.maximum
             self.min[i] = x.minimum
 
-        self.centroids = [None] * self.ndims
+        self.centroids = []
+        self.cids = None
+        self.cell_weights = None
 
         self.bin_size = bin_size
-        self.bin()
+
+        if self.rank == self.root:
+            self.bin()
+
+        self.rcb = RCB(self.ndims, self.dtype, coords=self.centroids,
+                       gids=self.cids, weights=self.cell_weights,
+                       proc_weights=self.proc_weights, root=self.root,
+                       tag=self.tag, backend=self.backend)
 
     def bin(self):
         fill_keys_knl = get_fill_keys_knl(self.ndims, self.backend)
@@ -819,8 +871,8 @@ class BinnedRCB(object):
         self.cell_weights = carr.empty(num_cids, np.float32,
                                        backend=self.backend)
         for dim in range(self.ndims):
-            self.centroids[dim] = carr.empty(num_cids, self.dtype,
-                                             backend=self.backend)
+            self.centroids.append(carr.empty(num_cids, self.dtype,
+                                             backend=self.backend))
 
         ncells_per_dim = np.empty(self.ndims, dtype=np.int32)
 
@@ -833,7 +885,6 @@ class BinnedRCB(object):
         fill_centroids_args = {'keys': self.keys,
                 'ncells_per_dim': ncells_per_dim,
                 'bin_size': bin_size, 'cell_to_key': self.cell_to_key,
-                'cell_weights': self.cell_weights,
                 'key_to_idx': self.key_to_idx,
                 'cell_to_idx': self.cell_to_idx}
 
@@ -850,10 +901,9 @@ class BinnedRCB(object):
         self.cids = carr.arange(0, num_cids, 1, np.int32,
                                 backend=self.backend)
 
-        self.rcb = RCB(self.ndims, self.dtype, coords=self.centroids,
-                       gids=self.cids, weights=self.cell_weights,
-                       proc_weights=self.proc_weights, root=self.root,
-                       tag=self.tag, backend=self.backend)
+        fill_cell_weights_knl(self.cell_to_idx, self.cell_weights,
+                              self.cell_num_objs, self.weights,
+                              self.cell_to_idx.length)
 
     def load_balance_raw(self):
         self.rcb.load_balance_raw()
@@ -874,10 +924,12 @@ class BinnedRCB(object):
 
         if self.rank == self.root:
             self.total_num_cells = np.sum(self.ncells_per_proc,
-                                         dtype=self.rcb.gids_view.dtype)
+                                          dtype=self.rcb.gids_view.dtype)
             self.all_cids = carr.empty(self.total_num_cells, np.int32,
                                        backend=self.backend)
             all_cids_buff = self.all_cids.get_buff()
+            self.all_gids = carr.empty(total_num_objs, np.int32,
+                                       backend=self.backend)
             displs = np.zeros(self.size, dtype=np.int32)
             np.cumsum(self.ncells_per_proc[:-1], out=displs[1:])
         else:
@@ -901,6 +953,14 @@ class BinnedRCB(object):
                           recvbuf=[all_cids_buff, self.ncells_per_proc, displs,
                                    dtype_to_mpi(self.rcb.gids_view.dtype)],
                           root=self.root)
+
+        if self.rank == self.root:
+            fill_gids_from_cids_knl = get_scan(inp_fill_gids_from_cids,
+                                               out_fill_gids_from_cids,
+                                               np.int32, self.backend)
+            fill_gids_from_cids_knl(all_cids=all_cids, all_gids=all_gids,
+                                    cell_to_idx=self.cell_to_idx,
+                                    cell_num_objs=self.cell_num_objs)
 
         # FIXME: tag
         self.plan = CommBase(None, sorted=True, root=self.root, tag=self.tag)
