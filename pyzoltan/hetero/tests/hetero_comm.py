@@ -19,18 +19,16 @@ gids = np.array(np.arange(size * numObjectsTotal)
 gids = gids.astype(np.uint32)
 
 # arbitrarily assign some objects to be sent to some other processor
-nsend = np.int32(random.random_integers(low=1, high=5))
-object_ids = random.random_integers(low=0, high=numObjectsTotal, size=nsend)
-proclist = random.random_integers(
-    low=0, high=size - 1, size=nsend
-).astype(np.int32)
+nsend = np.random.randint(1, 5 + 1)
+object_ids = np.random.randint(0, numObjectsTotal + 1, size=nsend)
+proclist = np.random.randint(0, size, size=nsend)
 
 my_indices = np.where(proclist == rank)[0]
 proclist[my_indices] = (rank + 1) % size
 
 # create the ZComm object
 tag = np.int32(0)
-hcomm = Comm(proclist, tag=tag, dtype=x.dtype)
+hcomm = Comm(proclist, tag=tag)
 
 # the data to send and receive
 senddata = x[object_ids]
@@ -44,15 +42,14 @@ hcomm.comm_do(senddata, recvdata)
 print("Proc %d, Received %s" % (rank, recvdata))
 
 # use zoltan to exchange unsigned ints
-senddata = gids[object_ids]
-recvdata = np.ones(hcomm.nreturn, dtype=np.uint32)
-hcomm.set_dtype(recvdata.dtype)
+#senddata = gids[object_ids]
+#recvdata = np.ones(hcomm.nreturn, dtype=np.uint32)
 
-print("Proc %d, Sending %s to %s" % (rank, senddata, proclist))
-senddata = wrap_array(senddata, backend='cython')
-recvdata = wrap_array(recvdata, backend='cython')
-hcomm.comm_do(senddata, recvdata)
-print("Proc %d, Received %s" % (rank, recvdata))
+#print("Proc %d, Sending %s to %s" % (rank, senddata, proclist))
+#senddata = wrap_array(senddata, backend='cython')
+#recvdata = wrap_array(recvdata, backend='cython')
+#hcomm.comm_do(senddata, recvdata)
+#print("Proc %d, Received %s" % (rank, recvdata))
 
 # Test the Comm Reverse function
 # modify the received data
