@@ -299,8 +299,6 @@ def setup_package():
         #        'There are no extension modules, Nothing to do!'
         #    )
 
-    print find_packages()
-
     setup(name='PyZoltan',
           version=info['__version__'],
           author='PySPH Developers',
