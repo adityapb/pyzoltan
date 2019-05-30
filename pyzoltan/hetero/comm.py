@@ -217,6 +217,7 @@ class Comm(CommBase):
             self.procs_to = np.empty(0, dtype=np.int32)
             self.lengths_to = np.empty(0, dtype=np.int32)
             self.nblocks = 0
+
         self._comm_invert_map(tag, self.lengths_to, self.procs_to)
 
     def _sort_proclist(self):
@@ -253,3 +254,16 @@ class Comm(CommBase):
             self.procs_from[i] = status.Get_source()
 
         self.set_recv_info(self.procs_from, self.lengths_from)
+
+
+class ObjectExchange(object):
+    def __init__(self):
+        self.import_proclist = None
+        self.import_gids = None
+        self.export_proclist = None
+        self.export_gids = None
+
+    def _find_import_lists(self):
+
+    def invert_lists(self):
+        pass

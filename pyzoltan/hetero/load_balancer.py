@@ -66,8 +66,10 @@ class LoadBalancer(object):
         self.weights = None
         self.gids = None
         self.data = []
+        self.local_data = []
 
         self.lb_data = LoadBalancerData()
+        self.set_lb_data()
 
     def set_coords(self, **kwargs):
         self.coord_names = list(kwargs.keys())
@@ -93,13 +95,31 @@ class LoadBalancer(object):
         self.data = [] if all(v is None for v in self.data) else \
                         self.data
         self.local_data = [None] * len(self.data_names)
+        self.set_lb_data()
 
     def set_lbfreq(self, lbfreq):
         self.lbfreq = lbfreq
 
+    def set_padding(self, padding):
+        self.padding = padding
+
     def add_data(self, ary, name):
         self.data_names.append(name)
         self.data.append(ary)
+
+    def set_lb_data(self, data=None):
+        if not data:
+            data = self.data
+
+        for i, x in enumerate(data):
+            setattr(self.lb_data, self.data_names[i], x)
+
+        for i, x in enumerate(self.coords):
+            setattr(self.lb_data, self.coord_names[i], x)
+
+        setattr(self.lb_data, 'gids', self.gids)
+        setattr(self.lb_data, 'weights', self.weights)
+        setattr(self.lb_data, 'proc_weights', self.proc_weights)
 
     def update_lb_data(self, data=None):
         if not data:
@@ -123,9 +143,10 @@ class LoadBalancer(object):
     def load_balance(self):
         if not self.lb_obj:
             self.lb_obj = self.algorithm(self.ndims, self.dtype, coords=self.coords,
-                                     gids=self.gids, weights=self.weights,
-                                     proc_weights=self.proc_weights,
-                                     root=self.root, backend=self.backend)
+                                         gids=self.gids, weights=self.weights,
+                                         proc_weights=self.proc_weights,
+                                         root=self.root, padding=self.padding,
+                                         backend=self.backend)
 
         if self.lb_count:
             self.lb_obj.gather(self.local_data)
@@ -145,13 +166,14 @@ class LoadBalancer(object):
         else:
             aligned_data = [None] * int(len_data)
 
-        senddtype = self.data[0].dtype if self.data else None
-
-        recvdtype = self.lb_obj.plan.get_recvdtype(senddtype)
+        recvdtype = [None] * int(len_data)
+        for i in range(len_data):
+            senddtype = self.data[i].dtype if self.data else None
+            recvdtype[i] = self.lb_obj.plan.get_recvdtype(senddtype)
 
         for i, senddata in enumerate(aligned_data):
-            if recvdtype:
-                recvdata = carr.empty(self.lb_obj.plan.nreturn, dtype=recvdtype,
+            if recvdtype[i]:
+                recvdata = carr.empty(self.lb_obj.plan.nreturn, dtype=recvdtype[i],
                                       backend=self.backend)
             else:
                 recvdata = None

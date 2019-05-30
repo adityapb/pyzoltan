@@ -33,11 +33,6 @@ def out_partition_domain(i, item, prev_item, target_w, target_idx):
         target_idx[0] = i
 
 
-@annotate
-def count_nsends(i, new_proc, self_proc):
-    return 1 if new_proc[i] != self_proc else 0
-
-
 class PointAssign(Template):
     def __init__(self, name, ndims):
         super(PointAssign, self).__init__(name=name)
@@ -82,7 +77,8 @@ class RCB(object):
     until each set has a single process.
     '''
     def __init__(self, ndims, dtype, coords=[], gids=None, weights=None,
-                 proc_weights=None, root=0, tag=111, backend=None):
+                 proc_weights=None, root=0, tag=111, padding=0.,
+                 backend=None):
         self.comm = mpi.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
@@ -99,6 +95,7 @@ class RCB(object):
         self.procs = None
         self.plan_recvs = []
         self.plan_transfers = []
+        self.padding = padding
 
         self.point_assign_f = PointAssign('point_assign', self.ndims).function
         self.point_assign_knl = Elementwise(self.point_assign_f,
@@ -138,6 +135,9 @@ class RCB(object):
         self.gids_view = self.gids.get_view() \
                 if self.gids else None
         self.coords_view = [x.get_view() for x in self.coords] if self.coords else []
+
+        self.max = np.zeros(self.ndims, dtype=self.dtype)
+        self.min = np.zeros(self.ndims, dtype=self.dtype)
 
     def _partition_procs(self):
         # NOTE: This can be made better using the weights
@@ -313,6 +313,7 @@ class RCB(object):
 
     def make_migrate_plan(self):
         new_proc = carr.empty(self.num_objs, np.int32, backend=self.backend)
+        new_proc.fill(self.rank)
         self.point_assign_knl(new_proc, self.mins, self.maxs,
                               self.size, *self.coords_view)
         self.migrate_plan = Comm(new_proc, root=self.root, backend=self.backend)
@@ -321,22 +322,20 @@ class RCB(object):
     def migrate_objects(self, data):
         new_proc = self.make_migrate_plan()
 
-        count_nsends_knl = Reduction('a+b', map_func=count_nsends,
-                                     dtype_out=np.int32, backend=self.backend)
-
-        nsends = int(count_nsends_knl(new_proc, self.rank))
-
         new_len = self.migrate_plan.nreturn
+        nsends = self.migrate_plan.nblocks
         # gids, weights, coords, data
 
-        if nsends == 0 and new_len == self.num_objs:
+        if nsends == 1 and new_len == self.num_objs:
             return
 
         new_coords = []
         new_data = []
 
-        new_gids = carr.empty(new_len, self.gids_view.dtype, backend=self.backend)
-        new_weights = carr.empty(new_len, self.weights_view.dtype, backend=self.backend)
+        new_gids = carr.empty(new_len, self.gids_view.dtype,
+                              backend=self.backend)
+        new_weights = carr.empty(new_len, self.weights_view.dtype,
+                                 backend=self.backend)
         for i, x in enumerate(self.coords_view):
             new_coords.append(carr.empty(new_len, x.dtype,
                                          backend=self.backend))
@@ -372,15 +371,24 @@ class RCB(object):
         req_max, req_min = None, None
 
         if self.rank == self.root:
-            self.max = np.zeros(self.ndims, dtype=self.dtype)
-            self.min = np.zeros(self.ndims, dtype=self.dtype)
-
             if self.coords_view:
                 update_minmax(self.coords_view)
 
             for i, x in enumerate(self.coords_view):
-                self.max[i] = x.maximum
-                self.min[i] = x.minimum
+                self.max[i] = self.padding + x.maximum * (1 + self.padding)
+                self.min[i] = -self.padding + x.minimum * (1 + self.padding)
+
+        #max_max = self.max.max()
+        #min_min = self.min.min()
+
+        #if isinstance(self.dtype, np.floating):
+        #    dtype_max = np.finfo(self.dtype).max
+        #    dtype_min = np.finfo(self.dtype).min
+        #else:
+        #    dtype_max = np.iinfo(self.dtype).max
+        #    dtype_min = np.finfo(self.dtype).min
+
+        #self.max = self.max * (dtype_max / max_max)
 
         if self.rank != self.root:
             status = mpi.Status()
@@ -489,14 +497,13 @@ class RCB(object):
             maxlen_idx, target_idx = self._partition_domain(target_w)
 
             part_dim = self.coords_view[maxlen_idx]
-            new_max = part_dim[target_idx - 1]
-            new_min = part_dim[target_idx - 1]
+            part_pos = 0.5 * (part_dim[target_idx - 1] + part_dim[target_idx])
 
-            self.max[maxlen_idx] = new_max
-            right_min[maxlen_idx] = new_min
+            self.max[maxlen_idx] = part_pos
+            right_min[maxlen_idx] = part_pos
 
             nsend_rcoords = np.asarray(self.coords_view[0].length - target_idx,
-                                     dtype=np.int32)
+                                       dtype=np.int32)
 
             # transfer nsend data
             self.comm.Send(nsend_rcoords, dest=right_proc, tag=self.tag + 2)
