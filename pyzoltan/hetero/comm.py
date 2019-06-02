@@ -257,13 +257,22 @@ class Comm(CommBase):
 
 
 class ObjectExchange(object):
-    def __init__(self):
+    def __init__(self, backend=None):
+        self.backend = get_backend(backend)
         self.import_proclist = None
         self.import_gids = None
         self.export_proclist = None
         self.export_gids = None
 
     def _find_import_lists(self):
+        import_plan = Comm(self.export_proclist, backend=self.backend)
+        if import_plan.nreturn:
+            self.import_gids = carr.empty(import_plan.nreturn,
+                                          backend=self.backend)
+        import_plan.comm_do(self.export_gids, self.import_gids)
+
+    def _find_export_lists(self):
+        pass
 
     def invert_lists(self):
         pass

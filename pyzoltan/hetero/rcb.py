@@ -33,6 +33,14 @@ def out_partition_domain(i, item, prev_item, target_w, target_idx):
         target_idx[0] = i
 
 
+@annotate
+def fill_new_proclist(i, new_proclist, displs, size):
+    for j in range(size):
+        if i >= displs[j]:
+            new_proclist[i] = j
+            return
+
+
 class PointAssign(Template):
     def __init__(self, name, ndims):
         super(PointAssign, self).__init__(name=name)
@@ -61,6 +69,112 @@ class PointAssign(Template):
                 new_proc[i] = j
                 return
         '''
+
+
+class InpBoxAssignLength(Template):
+    def __init__(self, name, ndims):
+        super(InpBoxAssignLength, self).__init__(name=name)
+        self.ndims = ndims
+        self.args = []
+        for i in range(self.ndims):
+            self.args.append('x%s' % i)
+
+    def extra_args(self):
+        return self.args, {}
+
+    def template(self, i, num_procs, self_proc, pmins, pmaxs, blength, size):
+        '''
+        proc_count = 0
+
+        for j in range(size):
+            if j == self_proc:
+                continue
+
+            count = 0
+
+            % for dim in range(obj.ndims):
+            pmax_dim = pmaxs[j * ${obj.ndims} + ${dim}]
+            pmin_dim = pmins[j * ${obj.ndims} + ${dim}]
+
+            plength_dim = pmax_dim - pmin_dim
+            pcentre_dim = 0.5 * (pmax_dim + pmin_dim)
+
+            if abs(x${dim}[i] - pcentre_dim) <= 0.5 * (plength_dim + blength):
+                count += 1
+
+            % endfor
+
+            if count == ${obj.ndims}:
+                proc_count += 1
+
+        return proc_count
+        '''
+
+
+def out_box_assign_length(i, item, num_procs):
+    num_procs[i] = item
+
+
+class BoxAssign(Template):
+    def __init__(self, name, ndims):
+        super(BoxAssign, self).__init__(name=name)
+        self.ndims = ndims
+        self.args = []
+        for i in range(self.ndims):
+            self.args.append('x%s' % i)
+
+    def extra_args(self):
+        return self.args, {}
+
+    def template(self, i, starts, nbr_procs, self_proc, pmins, pmaxs,
+                 blength, size):
+        '''
+        proc_count = 0
+        start = starts[i]
+
+        for j in range(size):
+            if j == self_proc:
+                continue
+
+            count = 0
+
+            % for dim in range(obj.ndims):
+            pmax_dim = pmaxs[j * ${obj.ndims} + ${dim}]
+            pmin_dim = pmins[j * ${obj.ndims} + ${dim}]
+
+            plength_dim = pmax_dim - pmin_dim
+            pcentre_dim = 0.5 * (pmax_dim + pmin_dim)
+
+            if abs(x${dim}[i] - pcentre_dim) <= 0.5 * (plength_dim + blength):
+                count += 1
+
+            % endfor
+
+            if count == ${obj.ndims}:
+                nbr_procs[start + proc_count] = j
+                proc_count += 1
+        '''
+
+
+@memoize(key=lambda args: tuple(args))
+def get_box_assign_length_kernel(ndims, backend):
+    inp_box_assign_length = InpBoxAssignLength(
+            'inp_box_assign_length', ndims
+            )
+    box_assign_length_knl = get_scan(
+            inp_box_assign_length, out_box_assign_length,
+            np.int32, backend
+            )
+    return box_assign_length_knl
+
+
+@memoize(key=lambda args: tuple(args))
+def get_box_assign_kernel(ndims, backend):
+    box_assign = InpBoxAssignLength(
+            'box_assign', ndims
+            )
+    box_assign_knl = get_elwise(box_assign, backend)
+    return box_assign_knl
 
 
 class RCB(object):
@@ -93,9 +207,10 @@ class RCB(object):
         self.tag = tag
         self.dtype = dtype
         self.procs = None
-        self.plan_recvs = []
         self.plan_transfers = []
         self.padding = padding
+        self.all_gids = None
+        self.displs = None
 
         self.point_assign_f = PointAssign('point_assign', self.ndims).function
         self.point_assign_knl = Elementwise(self.point_assign_f,
@@ -375,20 +490,9 @@ class RCB(object):
                 update_minmax(self.coords_view)
 
             for i, x in enumerate(self.coords_view):
-                self.max[i] = self.padding + x.maximum * (1 + self.padding)
-                self.min[i] = -self.padding + x.minimum * (1 + self.padding)
-
-        #max_max = self.max.max()
-        #min_min = self.min.min()
-
-        #if isinstance(self.dtype, np.floating):
-        #    dtype_max = np.finfo(self.dtype).max
-        #    dtype_min = np.finfo(self.dtype).min
-        #else:
-        #    dtype_max = np.iinfo(self.dtype).max
-        #    dtype_min = np.finfo(self.dtype).min
-
-        #self.max = self.max * (dtype_max / max_max)
+                xlength = x.maximum - x.minimum
+                self.max[i] = self.maximum + self.padding * xlength
+                self.min[i] = self.minimum - self.padding * xlength
 
         if self.rank != self.root:
             status = mpi.Status()
@@ -555,19 +659,23 @@ class RCB(object):
         self.comm.Gather(np.array(self.num_objs, dtype=np.int32),
                          self.nobjs_per_proc, root=self.root)
 
+        old_all_gids = self.all_gids
+        old_displs = self.displs
+        old_nobjs_per_proc = self.nobjs_per_proc
+
         if self.rank == self.root:
             self.total_num_objs = np.sum(self.nobjs_per_proc,
                                          dtype=self.gids_view.dtype)
             self.all_gids = carr.empty(self.total_num_objs, np.int32,
                                        backend=self.backend)
             all_gids_buff = self.all_gids.get_buff()
-            displs = np.zeros(self.size, dtype=np.int32)
-            np.cumsum(self.nobjs_per_proc[:-1], out=displs[1:])
+            self.displs = np.zeros(self.size, dtype=np.int32)
+            np.cumsum(self.nobjs_per_proc[:-1], out=self.displs[1:])
         else:
             self.total_num_objs = np.array(0, dtype=self.gids_view.dtype)
             self.all_gids = None
             all_gids_buff = None
-            displs = None
+            self.displs = None
 
         self.comm.Bcast(self.total_num_objs, root=self.root)
 
@@ -581,27 +689,91 @@ class RCB(object):
 
         self.comm.Gatherv(sendbuf=[self.gids_view.get_buff(),
                                    dtype_to_mpi(self.gids_view.dtype)],
-                          recvbuf=[all_gids_buff, self.nobjs_per_proc, displs,
+                          recvbuf=[all_gids_buff, self.nobjs_per_proc,
+                                   self.displs,
                                    dtype_to_mpi(self.gids_view.dtype)],
                           root=self.root)
 
-        # FIXME: tag
-        self.plan = CommBase(None, sorted=True, root=self.root, tag=self.tag)
-        procs_from = np.array([0], dtype=np.int32)
-        lengths_from = np.array([self.num_objs], dtype=np.int32)
+        if not old_all_gids:
+            # FIXME: tag
+            self.plan = CommBase(None, sorted=True, root=self.root, tag=self.tag)
+            procs_from = np.array([0], dtype=np.int32)
+            lengths_from = np.array([self.num_objs], dtype=np.int32)
 
-        if self.rank == self.root:
-            procs_to = np.arange(0, self.size, dtype=np.int32)
-            lengths_to = self.nobjs_per_proc
+            if self.rank == self.root:
+                procs_to = np.arange(0, self.size, dtype=np.int32)
+                lengths_to = self.nobjs_per_proc
+            else:
+                procs_to = np.array([], dtype=np.int32)
+                lengths_to = np.array([], dtype=np.int32)
+
+            self.plan.set_send_info(procs_to, lengths_to)
+            self.plan.set_recv_info(procs_from, lengths_from)
         else:
-            procs_to = np.array([], dtype=np.int32)
-            lengths_to = np.array([], dtype=np.int32)
+            # find the new proc for each object
+            # then create a plan with the new procs using the old gids
 
-        self.plan.set_send_info(procs_to, lengths_to)
-        self.plan.set_recv_info(procs_from, lengths_from)
+            # make a new procs array and align it according to new all_gids
+            if self.rank == self.root:
+                new_proclist = carr.empty(self.total_num_objs, np.int32,
+                                          backend=self.backend)
+
+                fill_new_proclist_knl = get_elwise(fill_new_proclist,
+                                                   backend=self.backend)
+
+                fill_new_proclist(new_proclist, self.displs, self.size)
+
+                semi_aligned_proclist = new_proclist.align(self.all_gids)
+
+                semi_aligned_proclist.align(old_all_gids, out=new_proclist)
+
+                new_proclist_buff = new_proclist.get_buff()
+            else:
+                new_proclist_buff = None
+
+
+            self.transfer_proclist = carr.empty(old_nobjs_per_proc[self.rank],
+                                                np.int32, backend=self.backend)
+
+            self.comm.Scatterv(sendbuf=[new_proclist_buff,
+                                        old_nobjs_per_proc, old_displs,
+                                        dtype_to_mpi(np.int32)],
+                               recvbuf=[self.transfer_proclist.get_buff(),
+                                        dtype_to_mpi(np.int32)],
+                               root=self.root)
+
+            self.plan = Comm(self.transfer_proclist, backend=self.backend)
+
+
+    def find_nbr_procs(self, box_size):
+        box_assign_length_knl = get_box_assign_length_kernel(
+                self.ndims, self.backend
+                )
+
+        num_procs = carr.zeros(self.num_objs, np.int32, backend=self.backend)
+
+        coord_args = {}
+        for i, x in enumerate(self.coords_view):
+            coord_args['x%s' % i] = x
+
+        box_assign_length_knl(num_procs=num_procs, self_proc=self.rank,
+                              pmins=self.mins, pmaxs=self.maxs,
+                              blength=box_size, size=self.size, **coord_args)
+
+        starts = carr.zeros_like(num_procs)
+
+        carr.cumsum(num_procs[:-1], out=starts[1:])
+
+        num_nbr_procs = num_procs[-1] + starts[-1]
+
+        nbr_procs = carr.empty(num_nbr_procs, backend=self.backend)
+
+        box_assign_knl = get_box_assign_kernel(self.ndims, self.backend)
+
+        box_assign_knl(starts, nbr_procs, self.rank, self.mins, self.maxs,
+                       box_size, self.size, *self.coords_view)
 
     def comm_do_post(self, senddata, recvdata):
-        self.plan_recvs.append(recvdata)
         self.plan.comm_do_post(senddata, recvdata)
 
     def comm_do_wait(self):
@@ -784,7 +956,6 @@ class BinnedRCB(object):
         self.tag = tag
         self.dtype = dtype
         self.procs = None
-        self.plan_recvs = []
         self.plan_transfers = []
 
         if self.gids and self.gids.dtype != np.int32:

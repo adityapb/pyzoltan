@@ -153,18 +153,21 @@ class LoadBalancer(object):
 
         if self.exec_count:
             self.lb_obj.adjust_proc_weights(self.exec_time, self.exec_nobjs,
-                                        self.exec_count)
+                                            self.exec_count)
 
         self.lb_obj.load_balance()
 
         len_data = len(self.data_names)
 
-        if self.lb_obj.rank == self.lb_obj.root and self.data:
-            # FIXME: This is creating new arrays everytime
-            aligned_data = carr.align(self.data, self.lb_obj.all_gids,
-                                      backend=self.backend)
+        if self.lb_count == 0:
+            if self.lb_obj.rank == self.lb_obj.root and self.data:
+                # FIXME: This is creating new arrays everytime
+                aligned_data = carr.align(self.data, self.lb_obj.all_gids,
+                                          backend=self.backend)
+            else:
+                aligned_data = [None] * int(len_data)
         else:
-            aligned_data = [None] * int(len_data)
+            aligned_data = self.data
 
         recvdtype = [None] * int(len_data)
         for i in range(len_data):
