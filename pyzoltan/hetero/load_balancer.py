@@ -60,6 +60,7 @@ class LoadBalancer(object):
         self.exec_count = 0
         self.lb_obj = None
         self.lb_count = 0
+        self.iter_count = 0
 
         self.coords = []
         self.proc_weights = None
@@ -148,9 +149,6 @@ class LoadBalancer(object):
                                          root=self.root, padding=self.padding,
                                          backend=self.backend)
 
-        if self.lb_count:
-            self.lb_obj.gather(self.local_data)
-
         if self.exec_count:
             self.lb_obj.adjust_proc_weights(self.exec_time, self.exec_nobjs,
                                             self.exec_count)
@@ -167,11 +165,11 @@ class LoadBalancer(object):
             else:
                 aligned_data = [None] * int(len_data)
         else:
-            aligned_data = self.data
+            aligned_data = self.local_data
 
         recvdtype = [None] * int(len_data)
         for i in range(len_data):
-            senddtype = self.data[i].dtype if self.data else None
+            senddtype = aligned_data[i].dtype if aligned_data[i] else None
             recvdtype[i] = self.lb_obj.plan.get_recvdtype(senddtype)
 
         for i, senddata in enumerate(aligned_data):
@@ -191,11 +189,11 @@ class LoadBalancer(object):
         self.lb_count += 1
 
     def update(self, migrate=True):
-        if self.lb_count % self.lbfreq == 0:
+        if self.iter_count % self.lbfreq == 0:
             self.load_balance()
             self.update_lb_data()
         elif migrate:
-            data = [getattr(self.lb_data, x) for x in self.data_names]
-            self.lb_obj.migrate_objects(data)
+            self.lb_obj.migrate_objects(self.local_data)
             self.update_lb_data()
+        self.iter_count += 1
 

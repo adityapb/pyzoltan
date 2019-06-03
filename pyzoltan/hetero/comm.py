@@ -261,8 +261,10 @@ class ObjectExchange(object):
         self.backend = get_backend(backend)
         self.import_proclist = None
         self.import_gids = None
+        self.import_lids = None
         self.export_proclist = None
         self.export_gids = None
+        self.export_lids = None
 
     def _find_import_lists(self):
         import_plan = Comm(self.export_proclist, backend=self.backend)
@@ -272,6 +274,10 @@ class ObjectExchange(object):
         import_plan.comm_do(self.export_gids, self.import_gids)
 
     def _find_export_lists(self):
+        pass
+
+    def export_data(self, data):
+        aligned_data = carr.align(data, self.export_lids, backend=self.backend)
         pass
 
     def invert_lists(self):

@@ -36,8 +36,8 @@ def out_partition_domain(i, item, prev_item, target_w, target_idx):
 @annotate
 def fill_new_proclist(i, new_proclist, displs, size):
     for j in range(size):
-        if i >= displs[j]:
-            new_proclist[i] = j
+        if i >= displs[size - j - 1]:
+            new_proclist[i] = size - j - 1
             return
 
 
@@ -52,8 +52,12 @@ class PointAssign(Template):
     def extra_args(self):
         return self.args, {}
 
-    def template(self, i, new_proc, mins, maxs, size):
+    def template(self, i, new_proc, mins, maxs, global_mins, global_maxs, size):
         '''
+        % for dim in range(obj.ndims):
+        gmax_${dim} = global_maxs[${dim}]
+        gmin_${dim} = global_mins[${dim}]
+        % endfor
         for j in range(size):
             count = 0
 
@@ -62,6 +66,10 @@ class PointAssign(Template):
             pmin_dim = mins[j * ${obj.ndims} + ${dim}]
 
             if x${dim}[i] <= pmax_dim and x${dim}[i] >= pmin_dim:
+                count += 1
+            elif x${dim}[i] <= pmax_dim and x${dim}[i] < gmin_${dim}:
+                count += 1
+            elif x${dim}[i] > gmax_${dim} and x${dim}[i] >= pmin_dim:
                 count += 1
             % endfor
 
@@ -209,8 +217,11 @@ class RCB(object):
         self.procs = None
         self.plan_transfers = []
         self.padding = padding
+        self.nobjs_per_proc = None
         self.all_gids = None
         self.displs = None
+        self.lb_done = False
+        self.adjusted = False
 
         self.point_assign_f = PointAssign('point_assign', self.ndims).function
         self.point_assign_knl = Elementwise(self.point_assign_f,
@@ -254,6 +265,15 @@ class RCB(object):
         self.max = np.zeros(self.ndims, dtype=self.dtype)
         self.min = np.zeros(self.ndims, dtype=self.dtype)
 
+        if self.rank == self.root:
+            self.all_exec_times = np.zeros(self.size, dtype=np.float32)
+            self.all_exec_nobjs = np.zeros(self.size, dtype=np.int32)
+            self.num_objs = self.gids.length
+        else:
+            self.all_exec_times = None
+            self.all_exec_nobjs = None
+            self.num_objs = 0
+
     def _partition_procs(self):
         # NOTE: This can be made better using the weights
         # of the procs and communication costs
@@ -267,6 +287,7 @@ class RCB(object):
         maxlen_idx = np.argmax(lengths)
 
         # sort data and gids according to max length dim
+        # FIXME: Clean up this mess
 
         order = carr.argsort(self.coords_view[maxlen_idx])
 
@@ -312,7 +333,7 @@ class RCB(object):
 
         return maxlen_idx, target_idx
 
-    def gather(self, data):
+    def gather(self, data=[]):
         nobjs_to_get = None
         if self.rank == self.root:
             nobjs_to_get = np.zeros(self.size,
@@ -333,8 +354,6 @@ class RCB(object):
                     for i in range(self.ndims)]
             gath_proc_weights = carr.empty(self.size, np.float32,
                                            backend=self.backend)
-            gath_procs = carr.arange(0, self.size, 1, dtype=np.int32,
-                                     backend=self.backend)
             gath_data = [carr.empty(total_nobjs, x.dtype, backend=self.backend) \
                     for x in data]
 
@@ -349,7 +368,6 @@ class RCB(object):
         else:
             gath_gids, gath_weights, gath_proc_weights = None, None, None
             gath_coords = [None] * self.ndims
-            gath_procs = None
             gath_data = [None] * len(data)
 
             gath_gids_buff = None
@@ -379,10 +397,14 @@ class RCB(object):
                                        dtype_to_mpi(x.dtype)],
                               root=self.root)
 
-        self.comm.Gather([self.proc_weights_view.get_buff(),
-                          dtype_to_mpi(self.proc_weights_view.dtype)],
-                          gath_proc_weights_buff,
-                          root=self.root)
+        if not self.adjusted:
+            self.comm.Gather([self.proc_weights_view.get_buff(),
+                              dtype_to_mpi(self.proc_weights_view.dtype)],
+                              gath_proc_weights_buff,
+                              root=self.root)
+        elif self.rank == self.root:
+            # proc weights are reset during adjustment
+            gath_proc_weights = self.proc_weights_view
 
         for i, ary in enumerate(data):
             self.comm.Gatherv(sendbuf=[ary.get_buff(),
@@ -394,14 +416,10 @@ class RCB(object):
         self.gids_view = gath_gids
         self.weights_view = gath_weights
         self.proc_weights_view = gath_proc_weights
-        self.procs_view = gath_procs
         if self.rank == self.root:
             self.coords_view = gath_coords
         else:
             self.coords_view = []
-
-        self.all_exec_times = np.zeros(self.size, dtype=np.float32)
-        self.all_exec_nobjs = np.zeros(self.size, dtype=np.int32)
 
         return gath_data
 
@@ -426,10 +444,16 @@ class RCB(object):
             self.proc_weights = wrap(proc_weights, backend=self.backend)
             self.proc_weights_view = self.proc_weights.get_view()
 
+            self.all_exec_times = np.zeros(self.size, dtype=np.float32)
+            self.all_exec_nobjs = np.zeros(self.size, dtype=np.int32)
+
+        self.adjusted = True
+
     def make_migrate_plan(self):
         new_proc = carr.empty(self.num_objs, np.int32, backend=self.backend)
         new_proc.fill(self.rank)
         self.point_assign_knl(new_proc, self.mins, self.maxs,
+                              self.global_mins, self.global_maxs,
                               self.size, *self.coords_view)
         self.migrate_plan = Comm(new_proc, root=self.root, backend=self.backend)
         return new_proc
@@ -441,7 +465,7 @@ class RCB(object):
         nsends = self.migrate_plan.nblocks
         # gids, weights, coords, data
 
-        if nsends == 1 and new_len == self.num_objs:
+        if nsends == 1 and new_len == self.num_objs and new_proc[0] == self.rank:
             return
 
         new_coords = []
@@ -478,6 +502,19 @@ class RCB(object):
 
         self.num_objs = int(new_len)
 
+    def update_bounds(self):
+        if self.rank == self.root:
+            if self.coords_view:
+                update_minmax(self.coords_view)
+
+            for i, x in enumerate(self.coords_view):
+                xlength = x.maximum - x.minimum
+                eps = 0.
+                if xlength == 0:
+                    eps = 10 * np.finfo(np.float32).eps
+                self.max[i] = eps + x.maximum + self.padding * xlength
+                self.min[i] = -eps + x.minimum - self.padding * xlength
+
     def load_balance_raw(self):
         # FIXME: These tags might mess with other sends and receives
         reqs_coords = []
@@ -486,13 +523,12 @@ class RCB(object):
         req_max, req_min = None, None
 
         if self.rank == self.root:
-            if self.coords_view:
-                update_minmax(self.coords_view)
+            self.procs_view = carr.arange(0, self.size, 1, dtype=np.int32,
+                                          backend=self.backend)
+        else:
+            self.procs_view = None
 
-            for i, x in enumerate(self.coords_view):
-                xlength = x.maximum - x.minimum
-                self.max[i] = self.maximum + self.padding * xlength
-                self.min[i] = self.minimum - self.padding * xlength
+        self.update_bounds()
 
         if self.rank != self.root:
             status = mpi.Status()
@@ -558,7 +594,6 @@ class RCB(object):
             if self.procs_view.length == 1:
                 mpi.Request.Waitall(reqs_coords)
                 req_objids.Wait()
-                self.num_objs = self.gids_view.length
                 req_max.Wait()
                 req_min.Wait()
                 req_w.Wait()
@@ -644,24 +679,31 @@ class RCB(object):
                 x.resize(target_idx)
             self.weights_view.resize(target_idx)
 
-        self.num_objs = self.gids_view.length
-
     def load_balance(self):
+        if self.lb_done:
+            self.gather()
+        self.old_all_gids = self.gids_view
         self.load_balance_raw()
         self.make_comm_plan()
 
     def make_comm_plan(self):
         # Send object ids back to root
+        old_num_objs = self.num_objs
+        # FIXME: Need to gather all gids from the previous iteration
+        # it is done anyways!
+        old_nobjs_per_proc = self.nobjs_per_proc
+        old_displs = self.displs
+
+        self.num_objs = self.gids_view.length
         self.nobjs_per_proc = None
+
         if self.rank == self.root:
             self.nobjs_per_proc = np.zeros(self.size, dtype=self.gids_view.dtype)
 
         self.comm.Gather(np.array(self.num_objs, dtype=np.int32),
                          self.nobjs_per_proc, root=self.root)
 
-        old_all_gids = self.all_gids
-        old_displs = self.displs
-        old_nobjs_per_proc = self.nobjs_per_proc
+        root_print("Current nobjs/proc = %s, num_objs = %s" % (self.nobjs_per_proc, self.num_objs))
 
         if self.rank == self.root:
             self.total_num_objs = np.sum(self.nobjs_per_proc,
@@ -687,6 +729,20 @@ class RCB(object):
         self.comm.Allgather(self.max, self.maxs.get_buff())
         self.comm.Allgather(self.min, self.mins.get_buff())
 
+        np_maxs = self.maxs.get()
+        np_mins = self.mins.get()
+
+        global_maxs = np.empty(self.ndims, dtype=self.maxs.dtype)
+        global_mins = np.empty(self.ndims, dtype=self.mins.dtype)
+
+        # FIXME: This can be optimized if required
+        for i in range(self.ndims):
+            global_maxs[i] = np_maxs[i::self.ndims].max()
+            global_mins[i] = np_mins[i::self.ndims].min()
+
+        self.global_maxs = wrap(global_maxs, backend=self.backend)
+        self.global_mins = wrap(global_mins, backend=self.backend)
+
         self.comm.Gatherv(sendbuf=[self.gids_view.get_buff(),
                                    dtype_to_mpi(self.gids_view.dtype)],
                           recvbuf=[all_gids_buff, self.nobjs_per_proc,
@@ -694,7 +750,7 @@ class RCB(object):
                                    dtype_to_mpi(self.gids_view.dtype)],
                           root=self.root)
 
-        if not old_all_gids:
+        if not self.lb_done:
             # FIXME: tag
             self.plan = CommBase(None, sorted=True, root=self.root, tag=self.tag)
             procs_from = np.array([0], dtype=np.int32)
@@ -714,26 +770,37 @@ class RCB(object):
             # then create a plan with the new procs using the old gids
 
             # make a new procs array and align it according to new all_gids
+            self.comm.Gather(np.array(old_num_objs, dtype=np.int32),
+                             old_nobjs_per_proc, root=self.root)
+
             if self.rank == self.root:
+                np.cumsum(old_nobjs_per_proc[:-1], out=old_displs[1:])
+
                 new_proclist = carr.empty(self.total_num_objs, np.int32,
                                           backend=self.backend)
 
                 fill_new_proclist_knl = get_elwise(fill_new_proclist,
                                                    backend=self.backend)
 
-                fill_new_proclist(new_proclist, self.displs, self.size)
+                # FIXME: Avoid wrapping this
+                displs_arr = wrap(self.displs, backend=self.backend)
+                fill_new_proclist_knl(new_proclist, displs_arr, self.size)
 
                 semi_aligned_proclist = new_proclist.align(self.all_gids)
 
-                semi_aligned_proclist.align(old_all_gids, out=new_proclist)
+                semi_aligned_proclist.align(self.old_all_gids, out=new_proclist)
 
                 new_proclist_buff = new_proclist.get_buff()
+
+                dbg_print(new_proclist)
             else:
                 new_proclist_buff = None
 
-
-            self.transfer_proclist = carr.empty(old_nobjs_per_proc[self.rank],
+            self.transfer_proclist = carr.empty(old_num_objs,
                                                 np.int32, backend=self.backend)
+            #dbg_print("%s %s %s %s" % (old_displs, old_nobjs_per_proc, old_num_objs, self.num_objs))
+            dbg_print("num_objs= %s" % old_num_objs)
+            root_print("Num objs = %s, displs = %s" % (old_nobjs_per_proc, old_displs))
 
             self.comm.Scatterv(sendbuf=[new_proclist_buff,
                                         old_nobjs_per_proc, old_displs,
@@ -742,8 +809,11 @@ class RCB(object):
                                         dtype_to_mpi(np.int32)],
                                root=self.root)
 
+            #dbg_print(self.transfer_proclist)
+
             self.plan = Comm(self.transfer_proclist, backend=self.backend)
 
+        self.lb_done = True
 
     def find_nbr_procs(self, box_size):
         box_assign_length_knl = get_box_assign_length_kernel(
