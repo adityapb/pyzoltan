@@ -24,13 +24,15 @@ def dtype_to_mpi(t):
 
 
 class CommBase(object):
-    def __init__(self, proclist, tag=0, root=0, backend=None, sorted=False):
+    def __init__(self, proclist, tag=0, root=0, backend=None, sorted=False,
+                 local_ids=None):
         self.comm = mpi.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
         self.sorted = sorted
         self.backend = get_backend(backend)
         self.root = root
+        self.local_ids = local_ids
         if proclist:
             self.nsends = len(proclist)
         self.proclist = proclist
@@ -98,16 +100,26 @@ class CommBase(object):
         # Make continuous buffers for each process the data
         # has to be sent to
         # store sendbuff
-        if not self.sorted:
-            if senddata and (self.blocked_senddata is None or \
-                    self.dtype != senddata.dtype):
-                self.blocked_senddata = carr.zeros(self.nsends, senddata.dtype,
-                                                   backend=self.backend)
-                self.dtype = senddata.dtype
+        if senddata and (self.blocked_senddata is None or \
+                self.dtype != senddata.dtype):
+            self.blocked_senddata = carr.empty(self.nsends, senddata.dtype,
+                                               backend=self.backend)
 
-            senddata.align(self.order, out=self.blocked_senddata)
+        if not self.sorted:
+            if self.local_ids and senddata and (self.gen_senddata is None or \
+                    self.dtype != senddata.dtype):
+                self.gen_senddata = carr.empty(self.nsends, senddata.dtype,
+                                               backend=self.backend)
+
+            senddata.align(self.local_ids, out=self.gen_senddata)
+            self.gen_senddata.align(self.order, out=self.blocked_senddata)
         else:
-            self.blocked_senddata = senddata
+            if self.local_ids:
+                senddata.align(self.local_ids, out=self.blocked_senddata)
+            else:
+                self.blocked_senddata = senddata
+
+        self.dtype = senddata.dtype
 
         for i in range(self.nrecvs):
             start = self.start_from[i]
@@ -175,10 +187,18 @@ def get_scan(inp_f, out_f, dtype, backend):
                 backend=backend)
 
 
+@memoize(key=lambda *args: tuple(args))
+def get_reduction(f, dtype, backend):
+    return Reduction('a+b', map_func=f, dtype=dtype,
+                     backend=backend)
+
+
 class Comm(CommBase):
-    def __init__(self, proclist, tag=0, root=0, backend=None, sorted=False):
+    def __init__(self, proclist, tag=0, root=0, local_ids=None,
+                 backend=None, sorted=False):
         super(Comm, self). __init__(proclist, tag=tag, root=root,
-                                    backend=backend, sorted=sorted)
+                                    backend=backend, local_ids=local_ids,
+                                    sorted=sorted)
         if len(self.proclist) > 0:
             if isinstance(self.proclist, np.ndarray):
                 self.proclist = wrap_array(self.proclist,
