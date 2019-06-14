@@ -7,7 +7,8 @@ from compyle.parallel import Scan, Reduction, Elementwise
 from compyle.template import Template
 from pyzoltan.hetero.comm import (Comm, CommBase, dtype_to_mpi,
                                   get_elwise, get_scan, get_reduction)
-from pyzoltan.hetero.cell_manager import flatten1, flatten2, flatten3
+from pyzoltan.hetero.cell_manager import (flatten1, flatten2, flatten3,
+                                          unflatten1, unflatten2, unflatten3)
 from pytools import memoize
 
 
@@ -270,6 +271,9 @@ class LoadBalancer(object):
             self.all_exec_times = None
             self.all_exec_nobjs = None
 
+    def set_cell_map(self, cell_map):
+        self.cell_map = cell_map
+
     def _partition_procs(self):
         # NOTE: This can be made better using the weights
         # of the procs and communication costs
@@ -321,9 +325,6 @@ class LoadBalancer(object):
         target_idx = int(target_idx[0])
 
         return maxlen_idx, target_idx
-
-    def set_cell_map(self, cell_map):
-        self.cell_map = cell_map
 
     def gather(self, data=[]):
         # NOTE FIXME: Implement this in object exchange
@@ -446,7 +447,7 @@ class LoadBalancer(object):
         new_proc = carr.empty(self.cm.num_objs, np.int32, backend=self.backend)
         new_proc.fill(self.rank)
         args = self.cm.coords + self.cm.min
-        self.point_assign_knl(cids, self.cell_map.cell_to_proc,
+        self.point_assign_knl(self.cm.cids, self.cell_map.cell_to_proc,
                               self.cell_map.key_to_cell, self.cm.ncells_per_dim,
                               *args)
         migrate_plan = Comm(new_proc, root=self.root, backend=self.backend)
@@ -538,8 +539,7 @@ class LoadBalancer(object):
 
             self.nrecv_centroids = int(nrecv_centroids)
 
-            self.cm.cids = carr.empty(self.nrecv_centroids, np.int32,
-                                         backend=self.backend)
+            self.cm.cids.resize(self.nrecv_centroids)
 
             req_cids = self.comm.Irecv(self.cm.cids.get_buff(),
                                          source=self.parent, tag=self.tag + 4)
@@ -550,19 +550,15 @@ class LoadBalancer(object):
             req_procw = self.comm.Irecv(self.proc_weights.get_buff(),
                                         source=self.parent, tag=self.tag + 5)
 
-            self.cm.cell_weights = carr.empty(self.nrecv_centroids, self.dtype,
-                                              backend=self.backend)
+            self.cm.cell_weights.resize(self.nrecv_centroids)
 
             req_w = self.comm.Irecv(self.cm.cell_weights.get_buff(),
                                     source=self.parent, tag=self.tag + 6)
 
             for i in range(self.ndims):
-                x = carr.empty(self.nrecv_centroids, self.dtype,
-                               backend=self.backend)
+                self.cm.centroids[i].resize(self.nrecv_centroids)
                 reqs_centroids.append(self.comm.Irecv(x.get_buff(),
                                    source=self.parent, tag=self.tag + 7 + i))
-                self.cm.centroids.append(x)
-
 
             req_max = self.comm.Irecv(self.max, source=self.parent,
                                       tag=self.tag + 10)
@@ -661,8 +657,7 @@ class LoadBalancer(object):
             self.cm.cell_weights.resize(target_idx)
 
     def load_balance(self):
-        if self.lb_done:
-            self.gather()
+        # NOTE: Gather before calling load balance
         self.old_all_cids = self.cids
         self.load_balance_raw()
         return self.make_comm_plan()
@@ -670,6 +665,7 @@ class LoadBalancer(object):
     def make_comm_plan(self):
         # Send object ids back to root
         old_num_objs = self.cm.num_objs
+        self.cm.calculate_num_objs()
         # FIXME: Need to gather all gids from the previous iteration
         # it is done anyways!
         old_nobjs_per_proc = self.nobjs_per_proc
@@ -725,8 +721,6 @@ class LoadBalancer(object):
                                     all_gids=self.all_gids,
                                     cell_to_idx=self.cm.cell_to_idx,
                                     cell_num_objs=self.cm.cell_num_objs)
-
-        self.cm.calculate_num_objs()
 
         if not self.lb_done:
             plan = CommBase(None, sorted=True, root=self.root, tag=self.tag)
