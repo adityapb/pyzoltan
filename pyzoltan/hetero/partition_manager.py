@@ -1,5 +1,10 @@
-from pyzoltan.load_balancer import LoadBalancer
-from pyzoltan.cell_map import CellMap
+from pyzoltan.hetero.load_balancer import LoadBalancer
+from pyzoltan.hetero.cell_map import CellMap
+from pyzoltan.hetero.comm import dbg_print
+from compyle.array import get_backend
+import compyle.array as carr
+import mpi4py.MPI as mpi
+import numpy as np
 
 
 class PartitionManager(object):
@@ -41,7 +46,7 @@ class PartitionManager(object):
     def set_proc_weights(self, proc_weights):
         self.proc_weights = proc_weights
 
-    def setup_cell_manager(self, cell_manager):
+    def set_cell_manager(self, cell_manager):
         self.cell_manager = cell_manager
 
     def set_object_exchange(self, object_exchange):
@@ -51,26 +56,29 @@ class PartitionManager(object):
         self.load_balancer = LoadBalancer(
                 self.ndims, self.dtype, self.cell_manager,
                 proc_weights=self.proc_weights, root=self.root,
-                tag=self.tag, backend=self.backend
+                backend=self.backend
                 )
         self.load_balancer.set_cell_map(self.cell_map)
 
-    def update(self, migrate=True):
+    def update(self, *coords, migrate=True):
         if self.iter_count % self.lbfreq == 0:
             # gather everything
-            self.cell_manager.generate_cells()
+            if self.lb_count:
+                self.object_exchange.gather()
+            if self.rank == self.root:
+                self.cell_manager.generate_cells(*coords)
             self.comm.Bcast(self.cell_manager.ncells_per_dim.get_buff(),
                             root=self.root)
-            plan = self.load_balance()
+            plan = self.load_balancer.load_balance()
+            self.object_exchange.set_plan(plan)
+            self.object_exchange.lb_transfer()
             # make ghost plan
+
+            self.lb_count += 1
         elif migrate:
-            plan = self.migrate_objects()
-        self.object_exchange.set_plan(plan)
+            plan = self.load_balancer.migrate_objects(*coords)
         # call plan in object exchange
         self.iter_count += 1
-
-    def migrate_objects(self):
-        pass
 
     def load_balance(self):
         # there are 3 types of comm plans. The plan with first time

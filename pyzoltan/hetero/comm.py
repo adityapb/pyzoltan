@@ -39,6 +39,7 @@ class CommBase(object):
         self.tag = tag
         self.blocked_senddata = None
         self.requests = []
+        self.inverted = False
 
     def set_send_info(self, procs_to, lengths_to):
         self.nblocks = len(procs_to)
@@ -57,6 +58,24 @@ class CommBase(object):
         self.start_from = np.zeros_like(self.lengths_from)
         np.cumsum(self.lengths_from[:-1], out=self.start_from[1:])
         self.nreturn = np.sum(self.lengths_from)
+
+    def invert_plan(self):
+        send_procs = self.procs_to
+        send_lengths = self.lengths_to
+        send_starts = self.starts
+        send_nsends = self.nsends
+
+        self.procs_to = self.procs_from
+        self.lengths_to = self.lengths_from
+        self.starts = self.starts_from
+        self.nsends = self.nreturn
+
+        self.procs_from = send_procs
+        self.lengths_from = send_lengths
+        self.starts_from = send_starts
+        self.nreturn = send_nsends
+
+        self.inverted = not self.inverted
 
     def get_recvdtype(self, senddtype):
         recvdtype = -1 + np.zeros_like(self.procs_from)
@@ -105,7 +124,7 @@ class CommBase(object):
             self.blocked_senddata = carr.empty(self.nsends, senddata.dtype,
                                                backend=self.backend)
 
-        if not self.sorted:
+        if not self.sorted and not self.inverted:
             if self.local_ids and senddata and (self.gen_senddata is None or \
                     self.dtype != senddata.dtype):
                 self.gen_senddata = carr.empty(self.nsends, senddata.dtype,
@@ -119,7 +138,8 @@ class CommBase(object):
             else:
                 self.blocked_senddata = senddata
 
-        self.dtype = senddata.dtype
+        if senddata:
+            self.dtype = senddata.dtype
 
         for i in range(self.nrecvs):
             start = self.start_from[i]
@@ -189,7 +209,7 @@ def get_scan(inp_f, out_f, dtype, backend):
 
 @memoize(key=lambda *args: tuple(args))
 def get_reduction(f, dtype, backend):
-    return Reduction('a+b', map_func=f, dtype=dtype,
+    return Reduction('a+b', map_func=f, dtype_out=dtype,
                      backend=backend)
 
 
@@ -205,6 +225,8 @@ class Comm(CommBase):
                                            backend=self.backend)
             if not self.sorted:
                 self.order = self._sort_proclist()
+
+            dbg_print(self.order)
 
             num_procs_knl = Reduction(
                     'a+b', dtype_out=np.int32, map_func=inp_unique_procs,
@@ -275,30 +297,3 @@ class Comm(CommBase):
 
         self.set_recv_info(self.procs_from, self.lengths_from)
 
-
-class ObjectExchange(object):
-    def __init__(self, backend=None):
-        self.backend = get_backend(backend)
-        self.import_proclist = None
-        self.import_gids = None
-        self.import_lids = None
-        self.export_proclist = None
-        self.export_gids = None
-        self.export_lids = None
-
-    def _find_import_lists(self):
-        import_plan = Comm(self.export_proclist, backend=self.backend)
-        if import_plan.nreturn:
-            self.import_gids = carr.empty(import_plan.nreturn,
-                                          backend=self.backend)
-        import_plan.comm_do(self.export_gids, self.import_gids)
-
-    def _find_export_lists(self):
-        pass
-
-    def export_data(self, data):
-        aligned_data = carr.align(data, self.export_lids, backend=self.backend)
-        pass
-
-    def invert_lists(self):
-        pass

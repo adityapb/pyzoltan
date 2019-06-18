@@ -13,3 +13,14 @@ class ObjectExchange(object):
 
     def comm_do(self, senddata, recvdata):
         self.plan.comm_do(senddata, recvdata)
+
+    def invert(self):
+        self.plan.invert_plan()
+
+    def lb_transfer(self):
+        raise NotImplementedError("ObjectExchange::lb_transfer called")
+
+    def gather(self):
+        self.invert()
+        self.lb_transfer()
+        self.invert()

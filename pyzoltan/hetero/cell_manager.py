@@ -5,7 +5,7 @@ from compyle.types import annotate, declare
 from compyle.low_level import cast
 from compyle.array import get_backend
 from pytools import memoize
-from pyzoltan.hetero.comm import get_elwise, get_scan
+from pyzoltan.hetero.comm import get_elwise, get_scan, get_reduction, dbg_print
 import compyle.array as carr
 from compyle.array import wrap
 
@@ -19,14 +19,16 @@ def flatten1(point, ncells_per_dim):
 
 @annotate(point='intp', ncells_per_dim='intp', return_='long')
 def flatten2(point, ncells_per_dim):
-    ncx = ncells_per_dim[0]
     res = declare('long')
+    ncx = declare('int')
+    ncx = ncells_per_dim[0]
     res = point[0] + ncx * point[1]
     return res
 
 
 @annotate(point='intp', ncells_per_dim='intp', return_='long')
 def flatten3(point, ncells_per_dim):
+    ncx, ncy = declare('int', 2)
     ncx = ncells_per_dim[0]
     ncy = ncells_per_dim[1]
     res = declare('long')
@@ -80,8 +82,8 @@ class FillKeys(Template):
 
 @memoize(key=lambda *args: tuple(args))
 def get_fill_keys_kernel(ndims, backend):
-    fill_keys = FillKeys('fill_keys', ndims).function
-    fill_keys_knl = get_elwise(fill_keys, backend)
+    fill_keys = FillKeys('fill_keys', ndims)
+    fill_keys_knl = get_elwise(fill_keys.function, backend)
     return fill_keys_knl
 
 
@@ -193,28 +195,21 @@ class CellManager(object):
 
         self.cell_num_objs = carr.empty(1, np.int32, backend=self.backend)
 
-    def set_coords(self, coords):
-        self.coords = coords
+        self.cids = None
+        self.gids = None
+        self.weights = None
 
     def set_weights(self, weights):
-        if weights:
-            self.weights = weights
-        else:
-            self.weights = carr.empty(self.num_objs, np.float32,
-                                      backend=self.backend)
+        self.weights = weights
 
     def set_gids(self, gids):
-        if gids:
-            self.gids = gids
-        else:
-            self.gids = carr.arange(0, self.num_objs, 1, np.int32,
-                                    backend=self.backend)
+        self.gids = gids
 
-    def update_bounds(self):
-        if self.coords:
-            carr.update_minmax(self.coords)
+    def update_bounds(self, *coords):
+        if coords:
+            carr.update_minmax(coords)
 
-        for i, x in enumerate(self.coords):
+        for i, x in enumerate(coords):
             xlength = x.maximum - x.minimum
             eps = 0.
             if xlength == 0:
@@ -234,8 +229,7 @@ class CellManager(object):
             self.cell_max[i] = eps + x.maximum + self.padding * xlength
             self.cell_min[i] = -eps + x.minimum - self.padding * xlength
 
-
-    def generate_cells(self):
+    def generate_cells(self, *coords):
         #if self.rank == self.root and self.weights is None:
         #    self.weights = carr.empty(self.num_objs, np.float32,
         #                              backend=self.backend)
@@ -244,6 +238,16 @@ class CellManager(object):
         #                            backend=self.backend)
         #elif self.rank == self.root:
         #    self.weights.dev /= carr.sum(self.weights)
+        self.update_bounds(*coords)
+
+        if not self.gids:
+            self.gids = carr.arange(0, self.num_objs, 1, np.int32,
+                                    backend=self.backend)
+
+        if not self.weights:
+            self.weights = carr.empty(self.num_objs, np.float32,
+                                      backend=self.backend)
+            self.weights.fill(1. / self.num_objs)
 
         fill_keys_knl = get_fill_keys_kernel(self.ndims, self.backend)
         fill_centroids_knl = get_fill_centroids_kernel(self.ndims,
@@ -258,18 +262,18 @@ class CellManager(object):
 
         self.ncells_per_dim.set(ncells_per_dim)
 
-        self.keys.resize(self.gids.length)
+        self.keys.resize(self.num_objs)
 
         fill_keys_args = [self.keys, self.cell_size, self.ncells_per_dim] + \
-                self.coords + list(self.min)
+                list(coords) + list(self.min)
 
         fill_keys_knl(*fill_keys_args)
 
         # sort
-        inp_list = [self.keys, self.gids] + self.coords
+        inp_list = [self.keys, self.gids] + list(coords)
         out_list = carr.sort_by_keys(inp_list, backend=self.backend)
         self.keys, self.gids = out_list[0], out_list[1]
-        self.coords = out_list[2:]
+        coords = out_list[2:]
 
         self.max_key = int(self.keys[-1])
 
@@ -279,7 +283,7 @@ class CellManager(object):
         num_cells_knl = Reduction('a+b', map_func=inp_fill_centroids,
                                  dtype_out=np.int32, backend=self.backend)
 
-        self.num_cells = int(num_cells_knl(self.keys))
+        self.num_cells = 1 + int(num_cells_knl(self.keys))
 
         self.cell_to_key.resize(self.num_cells)
         self.cell_to_idx.resize(self.num_cells)
@@ -299,7 +303,7 @@ class CellManager(object):
             arg_name = 'x%s' % dim
             min_arg_name = 'x%smin' % dim
             cen_arg_name = 'centroid%s' % dim
-            fill_centroids_args[arg_name] = self.coords[dim]
+            fill_centroids_args[arg_name] = coords[dim]
             fill_centroids_args[min_arg_name] = self.min[dim]
             fill_centroids_args[cen_arg_name] = self.centroids[dim]
 
@@ -315,5 +319,4 @@ class CellManager(object):
                               self.num_cells, self.num_objs)
 
     def calculate_num_objs(self):
-        find_num_objs_knl = get_reduction(find_num_objs)
-        self.num_objs = find_num_objs_knl(self.cids, self.cell_num_objs)
+        self.num_objs = carr.sum(self.cell_num_objs)

@@ -9,6 +9,7 @@ from pyzoltan.hetero.comm import (Comm, CommBase, dtype_to_mpi,
                                   get_elwise, get_scan, get_reduction)
 from pyzoltan.hetero.cell_manager import (flatten1, flatten2, flatten3,
                                           unflatten1, unflatten2, unflatten3)
+from pyzoltan.hetero.comm import dbg_print
 from pytools import memoize
 
 
@@ -32,13 +33,13 @@ def fill_new_proclist(i, new_proclist, displs, size):
 
 
 @annotate
-def inp_fill_gids_from_cids(i, cell_num_objs):
+def inp_fill_gids_from_cids(i, all_cids, cell_num_objs):
     cid = all_cids[i]
     return cell_num_objs[cid]
 
 
 @annotate
-def out_fill_gids_from_cids(i, all_cids, all_gids, cell_to_idx,
+def out_fill_gids_from_cids(i, item, prev_item, all_cids, all_gids, cell_to_idx,
                             cell_num_objs, gids):
     cid = all_cids[i]
     start_idx = cell_to_idx[cid]
@@ -53,24 +54,25 @@ class PointAssign(Template):
         super(PointAssign, self).__init__(name=name)
         self.ndims = ndims
         self.args = []
+        self.min_args = []
         for i in range(self.ndims):
             self.args.append('x%s' % i)
         for i in range(self.ndims):
-            self.args.append('x%smin' % i)
-        self.int_args = ['c%s' % j for j in range(self.ndims)]
-        self.int_args = ', '.join(self.int_args)
+            self.min_args.append('x%smin' % i)
 
     def extra_args(self):
-        return self.args, {}
+        return self.args + self.min_args, {}
 
-    def template(self, i, cids, cell_to_proc, key_to_cell, ncells_per_dim):
+    def template(self, i, cids, new_proc, cell_to_proc, key_to_cell,
+                 ncells_per_dim):
         '''
-        % for j, x in enumerate(obj.args)
-        c${j} = floor((${x}[i] - ${x}min) / cell_size)
+        point = declare('matrix(${obj.ndims}, "int")')
+        key = declare('long')
+        % for j, x in enumerate(obj.args):
+        point[${j}] = floor((${x}[i] - ${x}min) / cell_size)
         % endfor
-        key = flatten${obj.ndims}(${obj.int_args}, ncells_per_dim)
+        key = flatten${obj.ndims}(point, ncells_per_dim)
         cid = key_to_cell[key]
-        new_proc[i] = cell_to_proc[cid]
         '''
 
 
@@ -300,8 +302,8 @@ class LoadBalancer(object):
 
         out_list = carr.sort_by_keys(inp_list)
 
-        self.cm.cids = self.out_list[1]
-        self.cm.cell_weights = self.out_list[2]
+        self.cm.cids = out_list[1]
+        self.cm.cell_weights = out_list[2]
 
         # FIXME: Fix this mess. Perhaps by using an argument
         # in sort by keys to choose the place in the inp list
@@ -309,14 +311,14 @@ class LoadBalancer(object):
         curr_head = 3
         for i in range(self.ndims):
             if i != maxlen_idx:
-                out = self.out_list[curr_head]
+                out = out_list[curr_head]
                 self.cm.centroids[i] = out
                 curr_head += 1
 
         target_idx = carr.zeros(1, dtype=np.int32, backend=self.backend)
 
         split_idx_knl = Scan(inp_partition_domain, out_partition_domain,
-                             'a+b', dtype=self.cell_weights.dtype,
+                             'a+b', dtype=self.cm.cell_weights.dtype,
                              backend=self.backend)
 
         split_idx_knl(weights=self.cm.cell_weights, target_w=target_w,
@@ -443,59 +445,61 @@ class LoadBalancer(object):
 
         self.adjusted = True
 
-    def make_migrate_plan(self):
+    def migrate_objects(self, *coords):
         new_proc = carr.empty(self.cm.num_objs, np.int32, backend=self.backend)
         new_proc.fill(self.rank)
-        args = self.cm.coords + self.cm.min
-        self.point_assign_knl(self.cm.cids, self.cell_map.cell_to_proc,
+        args = list(coords) + list(self.cm.min)
+        #dbg_print(self.cm)
+        self.point_assign_knl(self.cm.cids, new_proc, self.cell_map.cell_proclist,
                               self.cell_map.key_to_cell, self.cm.ncells_per_dim,
                               *args)
+        dbg_print(new_proc)
         migrate_plan = Comm(new_proc, root=self.root, backend=self.backend)
         return migrate_plan
 
-    def migrate_objects(self, data):
-        new_proc = self.make_migrate_plan()
-
-        new_len = self.migrate_plan.nreturn
-        nsends = self.migrate_plan.nblocks
-        # gids, weights, coords, data
-
-        if nsends == 1 and new_len == self.num_objs and new_proc[0] == self.rank:
-            return
-
-        new_coords = []
-        new_data = []
-
-        new_gids = carr.empty(new_len, self.gids.dtype,
-                              backend=self.backend)
-        new_weights = carr.empty(new_len, self.weights.dtype,
-                                 backend=self.backend)
-        for i, x in enumerate(self.coords):
-            new_coords.append(carr.empty(new_len, x.dtype,
-                                         backend=self.backend))
-
-        for i, x in enumerate(data):
-            new_data.append(carr.empty(new_len, x.dtype, backend=self.backend))
-
-        self.migrate_plan.comm_do_post(self.gids, new_gids)
-        self.migrate_plan.comm_do_post(self.weights, new_weights)
-
-        for i, x in enumerate(self.coords):
-            self.migrate_plan.comm_do_post(x, new_coords[i])
-
-        for i, x in enumerate(data):
-            self.migrate_plan.comm_do_post(x, new_data[i])
-
-        self.migrate_plan.comm_do_wait()
-
-        self.gids.set_data(new_gids)
-        self.weights.set_data(new_weights)
-        for i, x_new in enumerate(new_coords):
-            self.coords[i].set_data(x_new)
-        for i, x_new in enumerate(new_data):
-            data[i].set_data(x_new)
-
-        self.num_objs = int(new_len)
+#    def migrate_objects(self, data):
+#        new_proc = self.make_migrate_plan()
+#
+#        new_len = self.migrate_plan.nreturn
+#        nsends = self.migrate_plan.nblocks
+#        # gids, weights, coords, data
+#
+#        if nsends == 1 and new_len == self.num_objs and new_proc[0] == self.rank:
+#            return
+#
+#        new_coords = []
+#        new_data = []
+#
+#        new_gids = carr.empty(new_len, self.gids.dtype,
+#                              backend=self.backend)
+#        new_weights = carr.empty(new_len, self.weights.dtype,
+#                                 backend=self.backend)
+#        for i, x in enumerate(self.coords):
+#            new_coords.append(carr.empty(new_len, x.dtype,
+#                                         backend=self.backend))
+#
+#        for i, x in enumerate(data):
+#            new_data.append(carr.empty(new_len, x.dtype, backend=self.backend))
+#
+#        self.migrate_plan.comm_do_post(self.gids, new_gids)
+#        self.migrate_plan.comm_do_post(self.weights, new_weights)
+#
+#        for i, x in enumerate(self.coords):
+#            self.migrate_plan.comm_do_post(x, new_coords[i])
+#
+#        for i, x in enumerate(data):
+#            self.migrate_plan.comm_do_post(x, new_data[i])
+#
+#        self.migrate_plan.comm_do_wait()
+#
+#        self.gids.set_data(new_gids)
+#        self.weights.set_data(new_weights)
+#        for i, x_new in enumerate(new_coords):
+#            self.coords[i].set_data(x_new)
+#        for i, x_new in enumerate(new_data):
+#            data[i].set_data(x_new)
+#
+#        self.num_objs = int(new_len)
 
     def load_balance_raw(self):
         # FIXME: These tags might mess with other sends and receives
@@ -503,6 +507,7 @@ class LoadBalancer(object):
         req_cids = None
         req_w = None
         req_max, req_min = None, None
+        req_cnobjs = None
 
         if self.rank == self.root:
             self.procs = carr.arange(0, self.size, 1, dtype=np.int32,
@@ -510,7 +515,7 @@ class LoadBalancer(object):
         else:
             self.procs = None
 
-        self.update_cell_bounds()
+        self.cm.update_cell_bounds()
 
         if self.rank != self.root:
             status = mpi.Status()
@@ -539,7 +544,8 @@ class LoadBalancer(object):
 
             self.nrecv_centroids = int(nrecv_centroids)
 
-            self.cm.cids.resize(self.nrecv_centroids)
+            self.cm.cids = carr.empty(self.nrecv_centroids, np.int32,
+                                      backend=self.backend)
 
             req_cids = self.comm.Irecv(self.cm.cids.get_buff(),
                                          source=self.parent, tag=self.tag + 4)
@@ -555,14 +561,19 @@ class LoadBalancer(object):
             req_w = self.comm.Irecv(self.cm.cell_weights.get_buff(),
                                     source=self.parent, tag=self.tag + 6)
 
-            for i in range(self.ndims):
-                self.cm.centroids[i].resize(self.nrecv_centroids)
+            self.cm.cell_num_objs.resize(self.nrecv_centroids)
+
+            req_cnobjs = self.comm.Irecv(self.cm.cell_num_objs.get_buff(),
+                                         source=self.parent, tag=self.tag + 12)
+
+            for i, x in enumerate(self.cm.centroids):
+                x.resize(self.nrecv_centroids)
                 reqs_centroids.append(self.comm.Irecv(x.get_buff(),
                                    source=self.parent, tag=self.tag + 7 + i))
 
-            req_max = self.comm.Irecv(self.max, source=self.parent,
+            req_max = self.comm.Irecv(self.cm.cell_max, source=self.parent,
                                       tag=self.tag + 10)
-            req_min = self.comm.Irecv(self.min, source=self.parent,
+            req_min = self.comm.Irecv(self.cm.cell_min, source=self.parent,
                                       tag=self.tag + 11)
 
             req_procs.Wait()
@@ -574,6 +585,7 @@ class LoadBalancer(object):
                 req_max.Wait()
                 req_min.Wait()
                 req_w.Wait()
+                req_cnobjs.Wait()
                 return
 
         while self.procs.length != 1:
@@ -607,15 +619,15 @@ class LoadBalancer(object):
                 req_cids.Wait()
                 req_cids = None
 
-            right_max = self.max.copy()
-            right_min = self.min.copy()
+            right_max = self.cm.cell_max.copy()
+            right_min = self.cm.cell_min.copy()
 
             maxlen_idx, target_idx = self._partition_domain(target_w)
 
             part_dim = self.cm.centroids[maxlen_idx]
             part_pos = 0.5 * (part_dim[target_idx - 1] + part_dim[target_idx])
 
-            self.max[maxlen_idx] = part_pos
+            self.cm.cell_max[maxlen_idx] = part_pos
             right_min[maxlen_idx] = part_pos
 
             nsend_rcentroids = np.asarray(self.cm.centroids[0].length - target_idx,
@@ -649,16 +661,23 @@ class LoadBalancer(object):
 
             self.comm.Send(right_min, dest=right_proc, tag=self.tag + 11)
 
+            # transfer cell num objs
+            if req_cnobjs:
+                req_cnobjs.Wait()
+            self.comm.Send(self.cm.cell_num_objs.get_buff(offset=target_idx),
+                           dest=right_proc, tag=self.tag + 12)
+
             self.procs.resize(part_idx)
             self.proc_weights.resize(part_idx)
             self.cm.cids.resize(target_idx)
             for x in self.cm.centroids:
                 x.resize(target_idx)
             self.cm.cell_weights.resize(target_idx)
+            self.cm.cell_num_objs.resize(target_idx)
 
     def load_balance(self):
         # NOTE: Gather before calling load balance
-        self.old_all_cids = self.cids
+        self.old_all_cids = self.cm.cids
         self.load_balance_raw()
         return self.make_comm_plan()
 
@@ -675,6 +694,15 @@ class LoadBalancer(object):
 
         self.ncells_per_proc = np.zeros(self.size,
                                         dtype=self.cm.cids.dtype)
+
+        if self.rank == self.root:
+            self.nobjs_per_proc = np.zeros(self.size,
+                                            dtype=self.cm.cids.dtype)
+        else:
+            self.nobjs_per_proc = None
+
+        self.comm.Gather(np.array(self.cm.num_objs, dtype=np.int32),
+                    self.nobjs_per_proc, root=self.root)
 
         self.comm.Allgather(np.array(self.cm.num_cells, dtype=np.int32),
                             self.ncells_per_proc)
@@ -704,14 +732,18 @@ class LoadBalancer(object):
         cell_proclist = carr.empty(self.total_num_cells, np.int32,
                                    backend=self.backend)
 
-        fill_new_proclist_knl = get_elwise(fill_new_proclist,
-                                           backend=self.backend)
+        if self.rank == self.root:
+            fill_new_proclist_knl = get_elwise(fill_new_proclist,
+                                               backend=self.backend)
 
-        displs_arr = wrap(displs, backend=self.backend)
-        fill_new_proclist_knl(cell_proclist, displs_arr, self.size)
+            displs_arr = wrap(displs, backend=self.backend)
 
-        self.cell_map.update(self.all_cids, cell_proclist, cell_to_key,
-                             self.cm.max_key)
+            fill_new_proclist_knl(cell_proclist, displs_arr, self.size)
+
+            self.cell_map.update(self.all_cids, cell_proclist, self.cm.cell_to_key,
+                                 self.cm.max_key)
+
+        self.cell_map.bcast(self.total_num_cells)
 
         if self.rank == self.root:
             fill_gids_from_cids_knl = get_scan(inp_fill_gids_from_cids,
@@ -719,6 +751,7 @@ class LoadBalancer(object):
                                                np.int32, self.backend)
             fill_gids_from_cids_knl(all_cids=self.all_cids,
                                     all_gids=self.all_gids,
+                                    gids=self.cm.gids,
                                     cell_to_idx=self.cm.cell_to_idx,
                                     cell_num_objs=self.cm.cell_num_objs)
 
@@ -730,7 +763,7 @@ class LoadBalancer(object):
 
             if self.rank == self.root:
                 procs_to = np.arange(0, self.size, dtype=np.int32)
-                lengths_to = self.ncells_per_proc
+                lengths_to = self.nobjs_per_proc
             else:
                 procs_to = np.array([], dtype=np.int32)
                 lengths_to = np.array([], dtype=np.int32)
@@ -775,6 +808,10 @@ class LoadBalancer(object):
             plan = Comm(self.transfer_proclist, backend=self.backend)
 
         # transfer gids using the comm plan
+        new_gids = carr.empty(plan.nreturn, np.int32, backend=self.backend)
+        plan.comm_do(self.cm.gids, new_gids)
+        # NOTE: The old gids array can be reused
+        self.cm.gids = new_gids
 
         # IMP FIXME: FIX THIS
         #self.lb_done = True

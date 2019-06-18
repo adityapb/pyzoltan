@@ -20,13 +20,10 @@ class TestCellManager(unittest.TestCase):
 
         gids = carr.arange(0, 100, 1, np.int32, backend='cython')
 
-        cell_manager.set_coords([x])
         cell_manager.set_weights(weights)
         cell_manager.set_gids(gids)
 
-        cell_manager.update_bounds()
-
-        cell_manager.generate_cells()
+        cell_manager.generate_cells(x)
 
         self.assertEqual(sum(cell_manager.cell_num_objs.get()), 100)
         self.assertAlmostEqual(sum(cell_manager.cell_weights.get()), 1.)
