@@ -34,6 +34,7 @@ def fill_new_proclist(i, new_proclist, displs, size):
 
 @annotate
 def inp_fill_gids_from_cids(i, all_cids, cell_num_objs):
+    cid = declare('int')
     cid = all_cids[i]
     return cell_num_objs[cid]
 
@@ -41,6 +42,7 @@ def inp_fill_gids_from_cids(i, all_cids, cell_num_objs):
 @annotate
 def out_fill_gids_from_cids(i, item, prev_item, all_cids, all_gids, cell_to_idx,
                             cell_num_objs, gids):
+    cid, start_idx, nobjs, j = declare('int', 4)
     cid = all_cids[i]
     start_idx = cell_to_idx[cid]
     nobjs = cell_num_objs[cid]
@@ -73,6 +75,7 @@ class PointAssign(Template):
         % endfor
         key = flatten${obj.ndims}(point, ncells_per_dim)
         cid = key_to_cell[key]
+        new_proc[i] = cell_to_proc[cid]
         '''
 
 
@@ -242,7 +245,7 @@ class LoadBalancer(object):
         self.cm = cell_manager
         self.ndims = ndims
         self.proc_weights = proc_weights
-        self.total_num_objs = self.cm.num_objs
+        #self.total_num_objs = self.cm.num_objs
         self.tag = tag
         self.dtype = dtype
         self.procs = None
@@ -328,97 +331,6 @@ class LoadBalancer(object):
 
         return maxlen_idx, target_idx
 
-    def gather(self, data=[]):
-        # NOTE FIXME: Implement this in object exchange
-        nobjs_to_get = None
-        if self.rank == self.root:
-            nobjs_to_get = np.zeros(self.size,
-                                    dtype=self.gids.dtype)
-
-        nobjs = self.gids.length
-
-        self.comm.Gather(np.array(nobjs, dtype=np.int32),
-                         nobjs_to_get, root=self.root)
-
-        if self.rank == self.root:
-            total_nobjs = np.sum(nobjs_to_get)
-            gath_gids = carr.empty(total_nobjs, np.int32,
-                                   backend=self.backend)
-            gath_weights = carr.empty(total_nobjs, np.float32,
-                                      backend=self.backend)
-            gath_coords = [carr.empty(total_nobjs, self.dtype, backend=self.backend) \
-                    for i in range(self.ndims)]
-            gath_proc_weights = carr.empty(self.size, np.float32,
-                                           backend=self.backend)
-            gath_data = [carr.empty(total_nobjs, x.dtype, backend=self.backend) \
-                    for x in data]
-
-            gath_gids_buff = gath_gids.get_buff()
-            gath_weights_buff = gath_weights.get_buff()
-            gath_coords_buff = [x.get_buff() for x in gath_coords]
-            gath_proc_weights_buff = gath_proc_weights.get_buff()
-            gath_data_buff = [x.get_buff() for x in gath_data]
-
-            displs = np.zeros(self.size, dtype=np.int32)
-            np.cumsum(nobjs_to_get[:-1], out=displs[1:])
-        else:
-            gath_gids, gath_weights, gath_proc_weights = None, None, None
-            gath_coords = [None] * self.ndims
-            gath_data = [None] * len(data)
-
-            gath_gids_buff = None
-            gath_weights_buff = None
-            gath_coords_buff = [None] * self.ndims
-            gath_proc_weights_buff = None
-            gath_data_buff = [None] * len(data)
-
-            displs = None
-
-        self.comm.Gatherv(sendbuf=[self.gids.get_buff(),
-                                   dtype_to_mpi(self.gids.dtype)],
-                          recvbuf=[gath_gids_buff, nobjs_to_get, displs,
-                                   dtype_to_mpi(self.gids.dtype)],
-                          root=self.root)
-
-        self.comm.Gatherv(sendbuf=[self.weights.get_buff(),
-                                   dtype_to_mpi(self.weights.dtype)],
-                          recvbuf=[gath_weights_buff, nobjs_to_get, displs,
-                                   dtype_to_mpi(self.weights.dtype)],
-                          root=self.root)
-
-        for i, x in enumerate(self.coords):
-            self.comm.Gatherv(sendbuf=[x.get_buff(),
-                                       dtype_to_mpi(x.dtype)],
-                              recvbuf=[gath_coords_buff[i], nobjs_to_get, displs,
-                                       dtype_to_mpi(x.dtype)],
-                              root=self.root)
-
-        if not self.adjusted:
-            self.comm.Gather([self.proc_weights.get_buff(),
-                              dtype_to_mpi(self.proc_weights.dtype)],
-                              gath_proc_weights_buff,
-                              root=self.root)
-        elif self.rank == self.root:
-            # proc weights are reset during adjustment
-            gath_proc_weights = self.proc_weights
-
-        for i, ary in enumerate(data):
-            self.comm.Gatherv(sendbuf=[ary.get_buff(),
-                                       dtype_to_mpi(ary.dtype)],
-                              recvbuf=[gath_data_buff[i], nobjs_to_get, displs,
-                                       dtype_to_mpi(ary.dtype)],
-                              root=self.root)
-
-        self.gids = gath_gids
-        self.weights = gath_weights
-        self.proc_weights = gath_proc_weights
-        if self.rank == self.root:
-            self.coords = gath_coords
-        else:
-            self.coords = []
-
-        return gath_data
-
     def adjust_proc_weights(self, exec_time, exec_nobjs, exec_count):
         # set new proc weights based on exec times
         # send all times to root
@@ -448,8 +360,8 @@ class LoadBalancer(object):
     def migrate_objects(self, *coords):
         new_proc = carr.empty(self.cm.num_objs, np.int32, backend=self.backend)
         new_proc.fill(self.rank)
+        #dbg_print("%s %s" % coords)
         args = list(coords) + list(self.cm.min)
-        #dbg_print(self.cm)
         self.point_assign_knl(self.cm.cids, new_proc, self.cell_map.cell_proclist,
                               self.cell_map.key_to_cell, self.cm.ncells_per_dim,
                               *args)
@@ -508,6 +420,18 @@ class LoadBalancer(object):
         req_w = None
         req_max, req_min = None, None
         req_cnobjs = None
+
+        # Gather proc weights
+        if self.proc_weights != None and self.proc_weights.length != self.size:
+            curr_weight = self.proc_weights[0]
+
+            if self.rank == self.root:
+                self.proc_weights.resize(self.size)
+            else:
+                self.proc_weights.resize(0)
+
+            self.comm.Gather(curr_weight, self.proc_weights.get_buff(),
+                             root=self.root)
 
         if self.rank == self.root:
             self.procs = carr.arange(0, self.size, 1, dtype=np.int32,
@@ -677,32 +601,30 @@ class LoadBalancer(object):
 
     def load_balance(self):
         # NOTE: Gather before calling load balance
-        self.old_all_cids = self.cm.cids
         self.load_balance_raw()
         return self.make_comm_plan()
 
     def make_comm_plan(self):
         # Send object ids back to root
         old_num_objs = self.cm.num_objs
-        self.cm.calculate_num_objs()
         # FIXME: Need to gather all gids from the previous iteration
         # it is done anyways!
         old_nobjs_per_proc = self.nobjs_per_proc
         old_displs = self.displs
 
         self.cm.num_cells = self.cm.cids.length
+        self.cm.calculate_num_objs()
 
         self.ncells_per_proc = np.zeros(self.size,
                                         dtype=self.cm.cids.dtype)
 
-        if self.rank == self.root:
-            self.nobjs_per_proc = np.zeros(self.size,
-                                            dtype=self.cm.cids.dtype)
-        else:
-            self.nobjs_per_proc = None
+        self.nobjs_per_proc = np.zeros(self.size,
+                                       dtype=self.cm.cids.dtype)
 
-        self.comm.Gather(np.array(self.cm.num_objs, dtype=np.int32),
-                    self.nobjs_per_proc, root=self.root)
+        self.comm.Allgather(np.array(self.cm.num_objs, dtype=np.int32),
+                            self.nobjs_per_proc)
+
+        self.total_num_objs = int(np.sum(self.nobjs_per_proc))
 
         self.comm.Allgather(np.array(self.cm.num_cells, dtype=np.int32),
                             self.ncells_per_proc)

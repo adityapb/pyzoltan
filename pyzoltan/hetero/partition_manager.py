@@ -24,6 +24,7 @@ class PartitionManager(object):
         self.exec_count = 0
         self.lb_count = 0
         self.iter_count = 0
+        self.lbfreq = 1
 
         self.weights = None
         self.gids = None
@@ -64,20 +65,21 @@ class PartitionManager(object):
         if self.iter_count % self.lbfreq == 0:
             # gather everything
             if self.lb_count:
-                self.object_exchange.gather()
+                coords = self.object_exchange.gather()
             if self.rank == self.root:
                 self.cell_manager.generate_cells(*coords)
             self.comm.Bcast(self.cell_manager.ncells_per_dim.get_buff(),
                             root=self.root)
             plan = self.load_balancer.load_balance()
             self.object_exchange.set_plan(plan)
-            self.object_exchange.lb_transfer()
-            # make ghost plan
-
+            self.object_exchange.transfer()
+            # TODO: make ghost plan
             self.lb_count += 1
         elif migrate:
             plan = self.load_balancer.migrate_objects(*coords)
-        # call plan in object exchange
+            self.object_exchange.set_plan(plan)
+            self.object_exchange.transfer()
+            self.cell_manager.num_objs = plan.nreturn
         self.iter_count += 1
 
     def load_balance(self):

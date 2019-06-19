@@ -1,7 +1,7 @@
 import mpi4py.MPI as mpi
 import numpy as np
 import compyle.array as carr
-from compyle.array import get_backend
+from compyle.array import get_backend, wrap_array
 from compyle.types import annotate, NP_TYPE_LIST
 from compyle.parallel import Elementwise, Reduction, Scan
 from pytools import memoize
@@ -33,7 +33,8 @@ class CommBase(object):
         self.backend = get_backend(backend)
         self.root = root
         self.local_ids = local_ids
-        if proclist:
+        self.dtype = None
+        if isinstance(proclist, np.ndarray) or proclist:
             self.nsends = len(proclist)
         self.proclist = proclist
         self.tag = tag
@@ -60,6 +61,8 @@ class CommBase(object):
         self.nreturn = np.sum(self.lengths_from)
 
     def invert_plan(self):
+        self.nrecvs = len(self.procs_to)
+        self.nblocks = len(self.procs_from)
         send_procs = self.procs_to
         send_lengths = self.lengths_to
         send_starts = self.starts
@@ -67,12 +70,12 @@ class CommBase(object):
 
         self.procs_to = self.procs_from
         self.lengths_to = self.lengths_from
-        self.starts = self.starts_from
+        self.starts = self.start_from
         self.nsends = self.nreturn
 
         self.procs_from = send_procs
         self.lengths_from = send_lengths
-        self.starts_from = send_starts
+        self.start_from = send_starts
         self.nreturn = send_nsends
 
         self.inverted = not self.inverted
@@ -130,8 +133,10 @@ class CommBase(object):
                 self.gen_senddata = carr.empty(self.nsends, senddata.dtype,
                                                backend=self.backend)
 
-            senddata.align(self.local_ids, out=self.gen_senddata)
-            self.gen_senddata.align(self.order, out=self.blocked_senddata)
+                senddata.align(self.local_ids, out=self.gen_senddata)
+                self.gen_senddata.align(self.order, out=self.blocked_senddata)
+            elif senddata and self.dtype != senddata.dtype:
+                senddata.align(self.order, out=self.blocked_senddata)
         else:
             if self.local_ids:
                 senddata.align(self.local_ids, out=self.blocked_senddata)
@@ -225,8 +230,6 @@ class Comm(CommBase):
                                            backend=self.backend)
             if not self.sorted:
                 self.order = self._sort_proclist()
-
-            dbg_print(self.order)
 
             num_procs_knl = Reduction(
                     'a+b', dtype_out=np.int32, map_func=inp_unique_procs,

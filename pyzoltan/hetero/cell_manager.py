@@ -158,14 +158,14 @@ def find_num_objs(i, cids, cell_num_objs):
 
 
 class CellManager(object):
-    def __init__(self, ndims, dtype, cell_size, padding=0., num_objs=0,
+    def __init__(self, ndims, dtype, cell_size, padding=0.,
                  backend=None):
         self.backend = get_backend(backend)
         self.ndims = ndims
-        self.num_objs = num_objs
         self.cell_size = cell_size
         self.padding = padding
         self.dtype = dtype
+        self.num_objs = None
 
         self.max = np.empty(ndims, dtype=dtype)
         self.min = np.empty(ndims, dtype=dtype)
@@ -173,7 +173,7 @@ class CellManager(object):
         self.cell_max = np.empty(ndims, dtype=dtype)
         self.cell_min = np.empty(ndims, dtype=dtype)
 
-        self.keys = carr.empty(self.num_objs, np.int64,
+        self.keys = carr.empty(1, np.int64,
                                backend=self.backend)
         self.key_to_idx = carr.zeros(1, np.int32,
                                      backend=self.backend)
@@ -202,9 +202,6 @@ class CellManager(object):
     def set_weights(self, weights):
         self.weights = weights
 
-    def set_gids(self, gids):
-        self.gids = gids
-
     def update_bounds(self, *coords):
         if coords:
             carr.update_minmax(coords)
@@ -213,7 +210,7 @@ class CellManager(object):
             xlength = x.maximum - x.minimum
             eps = 0.
             if xlength == 0:
-                eps = 10 * np.finfo(np.float32).eps
+                eps = 100 * np.finfo(np.float32).eps
             self.max[i] = eps + x.maximum + self.padding * xlength
             self.min[i] = -eps + x.minimum - self.padding * xlength
 
@@ -225,7 +222,7 @@ class CellManager(object):
             xlength = x.maximum - x.minimum
             eps = 0.
             if xlength == 0:
-                eps = 10 * np.finfo(np.float32).eps
+                eps = 100 * np.finfo(np.float32).eps
             self.cell_max[i] = eps + x.maximum + self.padding * xlength
             self.cell_min[i] = -eps + x.minimum - self.padding * xlength
 
@@ -238,11 +235,12 @@ class CellManager(object):
         #                            backend=self.backend)
         #elif self.rank == self.root:
         #    self.weights.dev /= carr.sum(self.weights)
+        self.num_objs = coords[0].length
+
         self.update_bounds(*coords)
 
-        if not self.gids:
-            self.gids = carr.arange(0, self.num_objs, 1, np.int32,
-                                    backend=self.backend)
+        self.gids = carr.arange(0, self.num_objs, 1, np.int32,
+                                backend=self.backend)
 
         if not self.weights:
             self.weights = carr.empty(self.num_objs, np.float32,
