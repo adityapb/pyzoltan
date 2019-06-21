@@ -78,7 +78,9 @@ class PartitionManager(object):
         elif migrate:
             plan = self.load_balancer.migrate_objects(*coords)
             self.object_exchange.set_plan(plan)
+            #dbg_print("BEFORE: %s %s" % (coords[0], coords[1]))
             self.object_exchange.transfer()
+            #dbg_print("AFTER: %s %s" % (coords[0], coords[1]))
             self.cell_manager.num_objs = plan.nreturn
         self.iter_count += 1
 

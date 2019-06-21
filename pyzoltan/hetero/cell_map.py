@@ -35,6 +35,7 @@ class CellMap(object):
 
         if self.max_key != self.key_to_cell.length:
             self.key_to_cell.resize(1 + max_key)
+            self.key_to_cell.fill(-1)
 
         if not self.all_cids or num_cells != self.all_cids.length:
             self.all_cids = carr.arange(0, num_cells, 1, np.int32,

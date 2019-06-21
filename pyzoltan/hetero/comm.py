@@ -135,7 +135,7 @@ class CommBase(object):
 
                 senddata.align(self.local_ids, out=self.gen_senddata)
                 self.gen_senddata.align(self.order, out=self.blocked_senddata)
-            elif senddata and self.dtype != senddata.dtype:
+            elif senddata:
                 senddata.align(self.order, out=self.blocked_senddata)
         else:
             if self.local_ids:

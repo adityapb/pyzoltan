@@ -75,7 +75,8 @@ class PointAssign(Template):
         % endfor
         key = flatten${obj.ndims}(point, ncells_per_dim)
         cid = key_to_cell[key]
-        new_proc[i] = cell_to_proc[cid]
+        if cid != -1:
+            new_proc[i] = cell_to_proc[cid]
         '''
 
 
@@ -93,6 +94,9 @@ class InpBoxAssignLength(Template):
 
     def template(self, i, cids, cell_to_key, ncells_per_dim, key_to_cell,
                  cell_to_proc, self_proc):
+        # Iterate over all objects and not all cells
+        # Because of migrate particles, some objects may
+        # be present in a non existent cell.
         '''
         proc_count = 0
         cid = cids[i]
@@ -365,7 +369,6 @@ class LoadBalancer(object):
         self.point_assign_knl(self.cm.cids, new_proc, self.cell_map.cell_proclist,
                               self.cell_map.key_to_cell, self.cm.ncells_per_dim,
                               *args)
-        dbg_print(new_proc)
         migrate_plan = Comm(new_proc, root=self.root, backend=self.backend)
         return migrate_plan
 
@@ -661,6 +664,10 @@ class LoadBalancer(object):
             displs_arr = wrap(displs, backend=self.backend)
 
             fill_new_proclist_knl(cell_proclist, displs_arr, self.size)
+
+            dbg_print("cids = %s" % self.cm.cids)
+
+            dbg_print("all cids = %s, procs = %s" % (self.all_cids, cell_proclist))
 
             self.cell_map.update(self.all_cids, cell_proclist, self.cm.cell_to_key,
                                  self.cm.max_key)
