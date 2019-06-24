@@ -1,10 +1,10 @@
-import pycuda.driver as drv
-import compyle.cuda as cu
 import mpi4py.MPI as mpi
 import cProfile
 
 
 def make_context(device_id=None, backend='cuda'):
+    import pycuda.driver as drv
+    import compyle.cuda as cu
     if backend != 'cuda':
         return
     if device_id is None:
