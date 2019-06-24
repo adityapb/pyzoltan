@@ -8,7 +8,7 @@ import numpy as np
 
 
 class PartitionManager(object):
-    def __init__(self, ndims, dtype, root=0, backend=None):
+    def __init__(self, ndims, dtype, root=0, migrate=False, backend=None):
         if not mpi.Is_initialized():
             mpi.Init()
         self.comm = mpi.COMM_WORLD
@@ -25,6 +25,7 @@ class PartitionManager(object):
         self.lb_count = 0
         self.iter_count = 0
         self.lbfreq = 1
+        self.migrate = migrate
 
         self.weights = None
         self.gids = None
@@ -57,11 +58,11 @@ class PartitionManager(object):
         self.load_balancer = LoadBalancer(
                 self.ndims, self.dtype, self.cell_manager,
                 proc_weights=self.proc_weights, root=self.root,
-                backend=self.backend
+                migrate=self.migrate, backend=self.backend
                 )
         self.load_balancer.set_cell_map(self.cell_map)
 
-    def update(self, *coords, migrate=True):
+    def update(self, *coords):
         if self.iter_count % self.lbfreq == 0:
             # gather everything
             if self.lb_count:
@@ -75,7 +76,7 @@ class PartitionManager(object):
             self.object_exchange.transfer()
             # TODO: make ghost plan
             self.lb_count += 1
-        elif migrate:
+        elif self.migrate:
             plan = self.load_balancer.migrate_objects(*coords)
             self.object_exchange.set_plan(plan)
             #dbg_print("BEFORE: %s %s" % (coords[0], coords[1]))

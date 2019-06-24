@@ -27,24 +27,26 @@ class CellMap(object):
         self.key_to_cell = carr.empty(1, np.int32, backend=self.backend)
         self.cell_to_key = carr.empty(1, np.int64, backend=self.backend)
         self.max_key = np.empty(1, dtype=np.int64)
+        self.total_num_cells = np.empty(1, dtype=np.int32)
         self.all_cids = None
 
     def resize(self, num_cells, max_key):
         if self.cell_proclist.length != num_cells:
-            self.cell_proclist.resize(num_cells)
+            self.cell_proclist.resize(int(num_cells))
 
         if self.max_key != self.key_to_cell.length:
             self.key_to_cell.resize(1 + max_key)
-            self.key_to_cell.fill(-1)
 
         if not self.all_cids or num_cells != self.all_cids.length:
             self.all_cids = carr.arange(0, num_cells, 1, np.int32,
                                         backend=self.backend)
 
-    def bcast(self, total_num_cells):
+    def bcast(self):
         self.comm.Bcast(self.max_key, root=self.root)
-        self.resize(total_num_cells, int(self.max_key))
-        self.cell_to_key.resize(total_num_cells)
+        self.comm.Bcast(self.total_num_cells, root=self.root)
+
+        self.resize(int(self.total_num_cells), int(self.max_key))
+        self.cell_to_key.resize(int(self.total_num_cells))
 
         self.comm.Bcast(self.cell_proclist.get_buff(), root=self.root)
         self.comm.Bcast(self.key_to_cell.get_buff(), root=self.root)
@@ -52,8 +54,10 @@ class CellMap(object):
 
     def update(self, all_cids, cell_proclist, cell_to_key, max_key):
         self.max_key = np.array(max_key, dtype=np.int64)
+        self.total_num_cells = np.array(all_cids.length, dtype=np.int32)
         self.cell_to_key = cell_to_key
-        self.resize(cell_proclist.length, int(self.max_key))
+        self.resize(int(self.total_num_cells), int(self.max_key))
+        self.key_to_cell.fill(-1)
 
         self.all_cids, self.cell_proclist = carr.sort_by_keys([all_cids, cell_proclist])
 

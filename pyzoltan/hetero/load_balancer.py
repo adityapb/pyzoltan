@@ -5,6 +5,7 @@ from compyle.array import get_backend, wrap, update_minmax
 from compyle.api import annotate
 from compyle.parallel import Scan, Reduction, Elementwise
 from compyle.template import Template
+from compyle.low_level import cast
 from pyzoltan.hetero.comm import (Comm, CommBase, dtype_to_mpi,
                                   get_elwise, get_scan, get_reduction)
 from pyzoltan.hetero.cell_manager import (flatten1, flatten2, flatten3,
@@ -65,16 +66,19 @@ class PointAssign(Template):
     def extra_args(self):
         return self.args + self.min_args, {}
 
-    def template(self, i, cids, new_proc, cell_to_proc, key_to_cell,
-                 ncells_per_dim):
+    def template(self, i, cids, new_proc, cell_size, cell_to_proc, key_to_cell,
+                 max_key, ncells_per_dim):
         '''
         point = declare('matrix(${obj.ndims}, "int")')
         key = declare('long')
         % for j, x in enumerate(obj.args):
-        point[${j}] = floor((${x}[i] - ${x}min) / cell_size)
+        point[${j}] = cast(floor((${x}[i] - ${x}min) / cell_size), 'int')
         % endfor
         key = flatten${obj.ndims}(point, ncells_per_dim)
-        cid = key_to_cell[key]
+        if key > max_key or key < 0:
+            cid = -1
+        else:
+            cid = key_to_cell[key]
         if cid != -1:
             new_proc[i] = cell_to_proc[cid]
         '''
@@ -240,7 +244,7 @@ class LoadBalancer(object):
     '''
     def __init__(self, ndims, dtype, cell_manager,
                  proc_weights=None, root=0, tag=111, padding=0.,
-                 backend=None):
+                 migrate=False, backend=None):
         self.comm = mpi.COMM_WORLD
         self.rank = self.comm.Get_rank()
         self.size = self.comm.Get_size()
@@ -249,16 +253,14 @@ class LoadBalancer(object):
         self.cm = cell_manager
         self.ndims = ndims
         self.proc_weights = proc_weights
-        #self.total_num_objs = self.cm.num_objs
         self.tag = tag
         self.dtype = dtype
         self.procs = None
         self.padding = padding
-        self.nobjs_per_proc = None
         self.all_gids = None
-        self.displs = None
         self.lb_done = False
         self.adjusted = False
+        self.migrate = migrate
 
         self.point_assign_f = PointAssign('point_assign', self.ndims).function
         self.point_assign_knl = Elementwise(self.point_assign_f,
@@ -364,10 +366,11 @@ class LoadBalancer(object):
     def migrate_objects(self, *coords):
         new_proc = carr.empty(self.cm.num_objs, np.int32, backend=self.backend)
         new_proc.fill(self.rank)
-        #dbg_print("%s %s" % coords)
         args = list(coords) + list(self.cm.min)
-        self.point_assign_knl(self.cm.cids, new_proc, self.cell_map.cell_proclist,
-                              self.cell_map.key_to_cell, self.cm.ncells_per_dim,
+        self.point_assign_knl(self.cm.cids, new_proc, self.cm.cell_size,
+                              self.cell_map.cell_proclist,
+                              self.cell_map.key_to_cell, int(self.cell_map.max_key),
+                              self.cm.ncells_per_dim,
                               *args)
         migrate_plan = Comm(new_proc, root=self.root, backend=self.backend)
         return migrate_plan
@@ -607,92 +610,127 @@ class LoadBalancer(object):
         self.load_balance_raw()
         return self.make_comm_plan()
 
+    def _calculate_nobjs_displs(self, num_objs):
+        if self.rank == self.root:
+            gids_displs = np.zeros(self.size, np.int32)
+            nobjs_per_proc = np.empty(self.size, np.int32)
+        else:
+            gids_displs = None
+            nobjs_per_proc = None
+
+        self.comm.Gather(np.array(num_objs, dtype=np.int32),
+                         nobjs_per_proc, root=self.root)
+
+        if self.rank == self.root:
+            np.cumsum(nobjs_per_proc[:-1], out=gids_displs[1:])
+
+        return nobjs_per_proc, gids_displs
+
+
     def make_comm_plan(self):
         # Send object ids back to root
-        old_num_objs = self.cm.num_objs
-        # FIXME: Need to gather all gids from the previous iteration
-        # it is done anyways!
-        old_nobjs_per_proc = self.nobjs_per_proc
-        old_displs = self.displs
-
         self.cm.num_cells = self.cm.cids.length
+
+        old_num_objs = self.cm.num_objs
+
+        # calculate the old gids displs before updating the num objs
+
+        if self.lb_done:
+            old_nobjs_per_proc, old_gids_displs = \
+                    self._calculate_nobjs_displs(self.cm.num_objs)
+
         self.cm.calculate_num_objs()
 
-        self.ncells_per_proc = np.zeros(self.size,
-                                        dtype=self.cm.cids.dtype)
+        nobjs_per_proc, gids_displs = \
+                self._calculate_nobjs_displs(self.cm.num_objs)
 
-        self.nobjs_per_proc = np.zeros(self.size,
-                                       dtype=self.cm.cids.dtype)
-
-        self.comm.Allgather(np.array(self.cm.num_objs, dtype=np.int32),
-                            self.nobjs_per_proc)
-
-        self.total_num_objs = int(np.sum(self.nobjs_per_proc))
-
-        self.comm.Allgather(np.array(self.cm.num_cells, dtype=np.int32),
-                            self.ncells_per_proc)
+        ncells_per_proc, cell_displs = \
+                self._calculate_nobjs_displs(self.cm.num_cells)
 
         if self.rank == self.root:
+            self.total_num_objs = np.sum(nobjs_per_proc, dtype=np.int32)
+            self.total_num_cells = np.sum(ncells_per_proc, dtype=np.int32)
+
+        if self.rank == self.root:
+            if self.lb_done:
+                old_all_gids = self.all_gids
+                old_all_gids_buff = old_all_gids.get_buff()
+
             self.all_gids = carr.empty(self.total_num_objs, np.int32,
                                        backend=self.backend)
+            self.all_cids = carr.empty(self.total_num_cells, np.int32,
+                                       backend=self.backend)
+            self.all_cell_nobjs = carr.empty(self.total_num_cells, np.int32,
+                                                backend=self.backend)
+            all_cids_buff = self.all_cids.get_buff()
+            all_cell_nobjs_buff = self.all_cell_nobjs.get_buff()
         else:
+            old_all_gids = None
             self.all_gids = None
+            old_all_gids_buff = None
+            all_cids_buff = None
+            all_cell_nobjs_buff = None
 
-        self.total_num_cells = np.sum(self.ncells_per_proc,
-                                      dtype=self.cm.cids.dtype)
-        self.all_cids = carr.empty(self.total_num_cells, np.int32,
-                                   backend=self.backend)
-        all_cids_buff = self.all_cids.get_buff()
-        displs = np.zeros(self.size, dtype=np.int32)
-        np.cumsum(self.ncells_per_proc[:-1], out=displs[1:])
+        if self.lb_done:
+            # Gather old all gids
+            self.comm.Gatherv(sendbuf=[self.cm.gids.get_buff(),
+                                       dtype_to_mpi(self.cm.gids.dtype)],
+                              recvbuf=[old_all_gids_buff, old_nobjs_per_proc,
+                                       gids_displs, dtype_to_mpi(self.cm.gids.dtype)],
+                              root=self.root)
 
         # Make a cell map
-        # also need to gather keys corresponding to the cids
-        self.comm.Allgatherv(sendbuf=[self.cm.cids.get_buff(),
+        self.comm.Gatherv(sendbuf=[self.cm.cids.get_buff(),
                                       dtype_to_mpi(self.cm.cids.dtype)],
-                             recvbuf=[all_cids_buff, self.ncells_per_proc, displs,
-                                      dtype_to_mpi(self.cm.cids.dtype)])
+                             recvbuf=[all_cids_buff, ncells_per_proc, cell_displs,
+                                      dtype_to_mpi(self.cm.cids.dtype)],
+                             root=self.root)
 
-        # generate cell map
-        cell_proclist = carr.empty(self.total_num_cells, np.int32,
-                                   backend=self.backend)
+        self.comm.Gatherv(sendbuf=[self.cm.cell_num_objs.get_buff(),
+                                      dtype_to_mpi(self.cm.cell_num_objs.dtype)],
+                             recvbuf=[all_cell_nobjs_buff, ncells_per_proc, cell_displs,
+                                      dtype_to_mpi(self.cm.cids.dtype)],
+                             root=self.root)
 
-        if self.rank == self.root:
-            fill_new_proclist_knl = get_elwise(fill_new_proclist,
-                                               backend=self.backend)
+        if self.migrate:
+            if self.rank == self.root:
+                cell_proclist = carr.empty(self.total_num_cells, np.int32,
+                                           backend=self.backend)
 
-            displs_arr = wrap(displs, backend=self.backend)
+                fill_new_proclist_knl = get_elwise(fill_new_proclist,
+                                                   backend=self.backend)
 
-            fill_new_proclist_knl(cell_proclist, displs_arr, self.size)
+                cell_displs_arr = wrap(cell_displs, backend=self.backend)
 
-            dbg_print("cids = %s" % self.cm.cids)
+                fill_new_proclist_knl(cell_proclist, cell_displs_arr,
+                                      self.size)
 
-            dbg_print("all cids = %s, procs = %s" % (self.all_cids, cell_proclist))
+                self.cell_map.update(self.all_cids, cell_proclist, self.cm.cell_to_key,
+                                     self.cm.max_key)
 
-            self.cell_map.update(self.all_cids, cell_proclist, self.cm.cell_to_key,
-                                 self.cm.max_key)
+            self.cell_map.bcast()
 
-        self.cell_map.bcast(self.total_num_cells)
-
-        if self.rank == self.root:
-            fill_gids_from_cids_knl = get_scan(inp_fill_gids_from_cids,
-                                               out_fill_gids_from_cids,
-                                               np.int32, self.backend)
-            fill_gids_from_cids_knl(all_cids=self.all_cids,
-                                    all_gids=self.all_gids,
-                                    gids=self.cm.gids,
-                                    cell_to_idx=self.cm.cell_to_idx,
-                                    cell_num_objs=self.cm.cell_num_objs)
+        #if self.rank == self.root:
+        #    self.all_cell_nobjs = self.all_cell_nobjs.align(self.all_cids)
+        #    fill_gids_from_cids_knl = get_scan(inp_fill_gids_from_cids,
+        #                                       out_fill_gids_from_cids,
+        #                                       np.int32, self.backend)
+        #    fill_gids_from_cids_knl(all_cids=self.all_cids,
+        #                            all_gids=self.all_gids,
+        #                            gids=self.cm.gids,
+        #                            cell_to_idx=self.cm.cell_to_idx,
+        #                            cell_num_objs=self.all_cell_nobjs)
 
         if not self.lb_done:
             plan = CommBase(None, sorted=True, root=self.root, tag=self.tag)
             procs_from = np.array([0], dtype=np.int32)
-            # num objs has to be calculated
             lengths_from = np.array([self.cm.num_objs], dtype=np.int32)
+
+            #dbg_print("%s %s" % (procs_from, lengths_from))
 
             if self.rank == self.root:
                 procs_to = np.arange(0, self.size, dtype=np.int32)
-                lengths_to = self.nobjs_per_proc
+                lengths_to = nobjs_per_proc
             else:
                 procs_to = np.array([], dtype=np.int32)
                 lengths_to = np.array([], dtype=np.int32)
@@ -700,12 +738,7 @@ class LoadBalancer(object):
             plan.set_send_info(procs_to, lengths_to)
             plan.set_recv_info(procs_from, lengths_from)
         else:
-            self.comm.Gather(np.array(old_num_objs, dtype=np.int32),
-                             old_nobjs_per_proc, root=self.root)
-
             if self.rank == self.root:
-                np.cumsum(old_nobjs_per_proc[:-1], out=old_displs[1:])
-
                 new_proclist = carr.empty(self.total_num_objs, np.int32,
                                           backend=self.backend)
 
@@ -713,12 +746,12 @@ class LoadBalancer(object):
                                                    backend=self.backend)
 
                 # FIXME: Avoid wrapping this
-                displs_arr = wrap(self.displs, backend=self.backend)
-                fill_new_proclist_knl(new_proclist, displs_arr, self.size)
+                gids_displs_arr = wrap(gids_displs, backend=self.backend)
+                fill_new_proclist_knl(new_proclist, gids_displs_arr, self.size)
 
                 semi_aligned_proclist = new_proclist.align(self.all_gids)
 
-                semi_aligned_proclist.align(self.old_all_gids, out=new_proclist)
+                semi_aligned_proclist.align(old_all_gids, out=new_proclist)
 
                 new_proclist_buff = new_proclist.get_buff()
             else:
@@ -728,7 +761,7 @@ class LoadBalancer(object):
                                                 np.int32, backend=self.backend)
 
             self.comm.Scatterv(sendbuf=[new_proclist_buff,
-                                        old_nobjs_per_proc, old_displs,
+                                        old_nobjs_per_proc, old_gids_displs,
                                         dtype_to_mpi(np.int32)],
                                recvbuf=[self.transfer_proclist.get_buff(),
                                         dtype_to_mpi(np.int32)],
@@ -743,5 +776,5 @@ class LoadBalancer(object):
         self.cm.gids = new_gids
 
         # IMP FIXME: FIX THIS
-        #self.lb_done = True
+        # self.lb_done = True
         return plan

@@ -32,8 +32,11 @@ class ObjectExchange(object):
         self.plan = Comm(proclist, sorted=True, root=self.plan.root,
                          tag=self.plan.tag, backend=self.plan.backend)
 
+    def gather_transfer(self):
+        return self.transfer()
+
     def gather(self):
         self.set_gather_plan()
-        coords = self.transfer()
+        coords = self.gather_transfer()
         self.plan = self.old_plan
         return coords

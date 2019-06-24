@@ -170,7 +170,8 @@ class CommBase(object):
 
     def comm_do_wait(self):
         if self.requests:
-            mpi.Request.Waitall(self.requests)
+            statuses = [mpi.Status() for req in self.requests]
+            mpi.Request.Waitall(self.requests, statuses=statuses)
             self.requests = []
 
     def comm_do(self, senddata, recvdata):
